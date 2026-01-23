@@ -1,0 +1,12 @@
+[package]
+name = "componentize-js-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+mozjs = { version = "0.14.8", default-features = false, features = ["intl", "libz-sys"] }
+# TODO: switch to a release when available:
+wit-dylib-ffi = { git = "https://github.com/dicej/wasm-tools", rev = "b072b0ca", features = ["async-raw"] }
