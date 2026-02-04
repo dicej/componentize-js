@@ -7,6 +7,8 @@ edition = "2024"
 crate-type = ["staticlib"]
 
 [dependencies]
+anyhow = "1.0.100"
 mozjs = { version = "0.14.8", default-features = false, features = ["intl", "libz-sys"] }
+wit-bindgen = "0.52.0"
 # TODO: switch to a release when available:
 wit-dylib-ffi = { git = "https://github.com/dicej/wasm-tools", rev = "b072b0ca", features = ["async-raw"] }

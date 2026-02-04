@@ -42,12 +42,7 @@ fn stubs_for_clippy(out_dir: &Path) -> Result<()> {
     let files = [
         "libcomponentize_js_runtime.so.zst",
         "libc.so.zst",
-        "libwasi-emulated-mman.so.zst",
-        "libwasi-emulated-process-clocks.so.zst",
         "libwasi-emulated-getpid.so.zst",
-        "libwasi-emulated-signal.so.zst",
-        "libc++.so.zst",
-        "libc++abi.so.zst",
         "wasi_snapshot_preview1.reactor.wasm.zst",
     ];
 
@@ -70,15 +65,7 @@ fn package_all_the_things(out_dir: &Path) -> Result<()> {
 
     make_runtime(out_dir, &wasi_sdk, "libcomponentize_js_runtime.so")?;
 
-    let libraries = [
-        "libc.so",
-        "libwasi-emulated-mman.so",
-        "libwasi-emulated-process-clocks.so",
-        "libwasi-emulated-getpid.so",
-        "libwasi-emulated-signal.so",
-        "libc++.so",
-        "libc++abi.so",
-    ];
+    let libraries = ["libc.so", "libwasi-emulated-getpid.so"];
 
     for library in libraries {
         compress(
@@ -160,7 +147,8 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> Result<()> {
                 .arg(out_dir.join(name))
                 .arg("-Wl,--whole-archive")
                 .arg(&path)
-                .arg("-Wl,--no-whole-archive"))?;
+                .arg("-Wl,--no-whole-archive")
+                .arg("-lwasi-emulated-getpid"))?;
 
             compress(out_dir, name, out_dir, false)?;
         } else {

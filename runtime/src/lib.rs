@@ -5,9 +5,26 @@
 )]
 
 use {
+    anyhow::{Context as _, anyhow, bail},
+    mozjs::{
+        context::JSContext,
+        glue::{CreateRustJSPrincipals, JSPrincipalsCallbacks},
+        jsapi::{
+            JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSPrincipals,
+            OnNewGlobalHookOption,
+        },
+        jsval::UndefinedValue,
+        realm::AutoRealm,
+        rooted,
+        rust::{
+            self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
+            wrappers2::{Evaluate, JS_DropPrincipals, JS_NewGlobalObject},
+        },
+    },
     std::{
         alloc::{self, Layout},
         marker::PhantomData,
+        ptr::{self, NonNull},
         sync::OnceLock,
     },
     wit_dylib_ffi::{
@@ -18,7 +35,7 @@ use {
 mod bindings {
     wit_bindgen::generate!({
         world: "init",
-        path: "../wit",
+        path: "../init.wit",
         generate_all,
     });
 
@@ -34,29 +51,30 @@ struct Object;
 struct EmptyResource;
 
 struct Principals<'a> {
-    cx: &'a JSContext,
-    raw: *const JSPrincipals,
+    cx: &'a mut JSContext,
+    raw: *mut JSPrincipals,
 }
 
 impl<'a> Principals<'a> {
-    fn new(cx: &'a JSContext) -> Self {
+    fn new(cx: &'a mut JSContext) -> Self {
         let raw = unsafe {
-            CreateRustJSPrincipals(
+            let raw = CreateRustJSPrincipals(
                 &JSPrincipalsCallbacks {
                     write: None,
                     isSystemOrAddonPrincipal: None,
                 },
                 ptr::null_mut(),
-            )
+            );
+            JS_HoldPrincipals(raw);
+            raw
         };
-        JS_HoldPrincipals(raw);
         Self { cx, raw }
     }
 }
 
 impl Drop for Principals<'_> {
     fn drop(&mut self) {
-        JS_DropPrincipals(cx, self.raw);
+        unsafe { JS_DropPrincipals(self.cx, self.raw) }
     }
 }
 
@@ -64,7 +82,7 @@ fn init(script: &str) -> anyhow::Result<()> {
     let engine = JSEngine::init()
         .map_err(|e| anyhow!("{e:?}"))
         .context("JSEngine::init failed")?;
-    let runtime = Runtime::new(engine.handle());
+    let mut runtime = Runtime::new(engine.handle());
     let cx = runtime.cx();
     let realm_options = RealmOptions::default();
     let principals = Principals::new(cx);
@@ -81,28 +99,36 @@ fn init(script: &str) -> anyhow::Result<()> {
         trace: None,
     };
     let global_class = JSClass {
-        name: c"GlobalObject",
+        name: c"GlobalObject".as_ptr(),
         flags: JSCLASS_GLOBAL_FLAGS,
         cOps: &global_class_ops,
         spec: ptr::null(),
         ext: ptr::null(),
         oOps: ptr::null(),
     };
-    let global_object = unsafe {
+    let global_object = NonNull::new(unsafe {
         JS_NewGlobalObject(
-            cx,
+            principals.cx,
             &global_class,
             principals.raw,
             OnNewGlobalHookOption::DontFireOnNewGlobalHook,
-            &realm_options,
+            &*realm_options,
         )
-    };
-    let _realm = JSAutoRealm::new(cx, global_object);
-    let compile_options = CompileOptionsWrapper::new(cx, "script", 1);
+    })
+    .unwrap();
+    let mut realm = AutoRealm::new(principals.cx, global_object);
+    let compile_options = CompileOptionsWrapper::new(&realm, "script", 1);
     let mut script = rust::transform_u16_to_source_text(&script.encode_utf16().collect::<Vec<_>>());
-    rooted!(in(cx) let mut result = UndefinedValue());
+    rooted!(&in(&mut realm) let mut result = UndefinedValue());
     // TODO: check for thrown exception?
-    if !unsafe { Evaluate(cx, compile_options.ptr, &mut script, result) } {
+    if !unsafe {
+        Evaluate(
+            &mut realm,
+            compile_options.ptr,
+            &mut script,
+            result.handle_mut(),
+        )
+    } {
         bail!("Evaluate failed")
     }
     Ok(())
@@ -110,7 +136,7 @@ fn init(script: &str) -> anyhow::Result<()> {
 
 struct MyExports;
 
-impl Guest for MyExports {
+impl bindings::Guest for MyExports {
     fn init(script: String) -> Result<(), String> {
         let result = init(&script).map_err(|e| format!("{e:?}"));
 

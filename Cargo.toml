@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.100"
+bytes = "1.11.1"
+tokio = { version = "1.49.0", features = ["macros", "rt", "rt-multi-thread", "fs"] }
+wasmtime = "41.0.2"
+wasmtime-wasi = "41.0.2"
+wasmtime-wizer = { version = "41.0.2", features = ["component-model", "wasmtime"] }
+wit-component = "0.244.0"
+wit-dylib = "0.244.0"
+wit-parser = "0.244.0"
+zstd = "0.13.3"
 
 [workspace]
 members = ["runtime"]
