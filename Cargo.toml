@@ -20,4 +20,6 @@ members = ["runtime"]
 
 [build-dependencies]
 anyhow = "1.0.100"
+wasm-encoder = "0.244.0"
+wasmparser = "0.244.0"
 zstd = "0.13.3"

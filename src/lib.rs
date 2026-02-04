@@ -4,11 +4,11 @@ use {
     std::io::Cursor,
     wasmtime::{
         Config, Engine, Store,
-        component::{Linker, ResourceTable},
+        component::{Component, Linker, ResourceTable},
     },
     wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView},
-    wasmtime_wizer::Wizer,
+    wasmtime_wizer::{WasmtimeWizerComponent, Wizer},
     wit_dylib::DylibOpts,
     wit_parser::Resolve,
 };
@@ -114,26 +114,35 @@ pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::R
     let engine = Engine::new(&config)?;
     let mut store = Store::new(&engine, Ctx { wasi, table });
 
-    Wizer::new()
-        .run_component(&mut store, &component, async |mut store, component| {
-            let mut linker = Linker::new(&engine);
-            wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-            let instance = linker.instantiate_async(&mut store, component).await?;
-            {
-                let instance = Init::new(&mut store, &instance)?;
-                instance
-                    .call_init(&mut store, js)
-                    .await?
-                    .map_err(|e| anyhow!("{e}"))?;
-            }
-            Ok(instance)
-        })
+    let wizer = Wizer::new();
+    let (cx, component) = wizer.instrument_component(&component)?;
+    let component = Component::new(&engine, &component)?;
+
+    let mut linker = Linker::new(&engine);
+    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    {
+        let instance = Init::new(&mut store, &instance)?;
+        instance
+            .call_init(&mut store, js)
+            .await?
+            .map_err(|e| anyhow!("{e}"))
+            .with_context(move || {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout.contents()),
+                    String::from_utf8_lossy(&stderr.contents())
+                )
+            })?;
+    }
+
+    wizer
+        .snapshot_component(
+            cx,
+            &mut WasmtimeWizerComponent {
+                store: &mut store,
+                instance,
+            },
+        )
         .await
-        .with_context(move || {
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&stdout.try_into_inner().unwrap()),
-                String::from_utf8_lossy(&stderr.try_into_inner().unwrap())
-            )
-        })
 }
