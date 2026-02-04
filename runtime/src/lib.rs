@@ -15,11 +15,131 @@ use {
     },
 };
 
+mod bindings {
+    wit_bindgen::generate!({
+        world: "init",
+        path: "../wit",
+        generate_all,
+    });
+
+    use super::MyExports;
+
+    export!(MyExports);
+}
+
 static WIT: OnceLock<Wit> = OnceLock::new();
 
 struct Borrow;
 struct Object;
 struct EmptyResource;
+
+struct Principals<'a> {
+    cx: &'a JSContext,
+    raw: *const JSPrincipals,
+}
+
+impl<'a> Principals<'a> {
+    fn new(cx: &'a JSContext) -> Self {
+        let raw = unsafe {
+            CreateRustJSPrincipals(
+                &JSPrincipalsCallbacks {
+                    write: None,
+                    isSystemOrAddonPrincipal: None,
+                },
+                ptr::null_mut(),
+            )
+        };
+        JS_HoldPrincipals(raw);
+        Self { cx, raw }
+    }
+}
+
+impl Drop for Principals<'_> {
+    fn drop(&mut self) {
+        JS_DropPrincipals(cx, self.raw);
+    }
+}
+
+fn init(script: &str) -> anyhow::Result<()> {
+    let engine = JSEngine::init()
+        .map_err(|e| anyhow!("{e:?}"))
+        .context("JSEngine::init failed")?;
+    let runtime = Runtime::new(engine.handle());
+    let cx = runtime.cx();
+    let realm_options = RealmOptions::default();
+    let principals = Principals::new(cx);
+    let global_class_ops = JSClassOps {
+        addProperty: None,
+        delProperty: None,
+        enumerate: None,
+        newEnumerate: None,
+        resolve: None,
+        mayResolve: None,
+        finalize: None,
+        call: None,
+        construct: None,
+        trace: None,
+    };
+    let global_class = JSClass {
+        name: c"GlobalObject",
+        flags: JSCLASS_GLOBAL_FLAGS,
+        cOps: &global_class_ops,
+        spec: ptr::null(),
+        ext: ptr::null(),
+        oOps: ptr::null(),
+    };
+    let global_object = unsafe {
+        JS_NewGlobalObject(
+            cx,
+            &global_class,
+            principals.raw,
+            OnNewGlobalHookOption::DontFireOnNewGlobalHook,
+            &realm_options,
+        )
+    };
+    let _realm = JSAutoRealm::new(cx, global_object);
+    let compile_options = CompileOptionsWrapper::new(cx, "script", 1);
+    let mut script = rust::transform_u16_to_source_text(&script.encode_utf16().collect::<Vec<_>>());
+    rooted!(in(cx) let mut result = UndefinedValue());
+    // TODO: check for thrown exception?
+    if !unsafe { Evaluate(cx, compile_options.ptr, &mut script, result) } {
+        bail!("Evaluate failed")
+    }
+    Ok(())
+}
+
+struct MyExports;
+
+impl Guest for MyExports {
+    fn init(script: String) -> Result<(), String> {
+        let result = init(&script).map_err(|e| format!("{e:?}"));
+
+        // This tells the WASI Preview 1 component adapter to reset its state.
+        // In particular, we want it to forget about any open handles and
+        // re-request the stdio handles at runtime since we'll be running under
+        // a brand new host.
+        #[link(wasm_import_module = "wasi_snapshot_preview1")]
+        unsafe extern "C" {
+            #[link_name = "reset_adapter_state"]
+            fn reset_adapter_state();
+        }
+
+        // This tells wasi-libc to reset its preopen state, forcing
+        // re-initialization at runtime.
+        #[link(wasm_import_module = "env")]
+        unsafe extern "C" {
+            #[link_name = "__wasilibc_reset_preopens"]
+            fn wasilibc_reset_preopens();
+        }
+
+        unsafe {
+            reset_adapter_state();
+            wasilibc_reset_preopens();
+        }
+
+        result
+    }
+}
 
 struct MyInterpreter;
 
