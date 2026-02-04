@@ -1,0 +1,26 @@
+package componentize-js:tests;
+
+interface simple-export {
+  foo: func(v: u32) -> u32;
+}
+
+interface simple-async-export {
+  foo: async func(v: u32) -> u32;
+}
+
+interface simple-import-and-export {
+    foo: func(v: u32) -> u32;
+}
+
+interface simple-async-import-and-export {
+    foo: async func(v: u32) -> u32;
+}
+
+world tests {
+  export simple-export;
+  export simple-async-export;
+  export simple-import-and-export;
+  import simple-import-and-export;
+  export simple-async-import-and-export;
+  import simple-async-import-and-export;  
+}

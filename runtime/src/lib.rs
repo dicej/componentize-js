@@ -5,28 +5,273 @@
 )]
 
 use {
+    anyhow::{Context as _, anyhow, bail},
+    mozjs::{
+        context::JSContext,
+        glue::{
+            CreateRustJSPrincipals, DestroyRustJSPrincipals, JSPrincipalsCallbacks,
+            PrintAndClearException,
+        },
+        jsapi::{
+            HandleValueArray, JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps,
+            JSObject, OnNewGlobalHookOption, Value,
+        },
+        jsval::{UInt32Value, UndefinedValue},
+        realm::AutoRealm,
+        rooted,
+        rust::{
+            self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
+            wrappers2::{
+                CurrentGlobalOrNull, Evaluate, JS_CallFunctionValue, JS_GetProperty,
+                JS_InitDestroyPrincipalsCallback, JS_NewGlobalObject, JS_ValueToObject,
+            },
+        },
+    },
     std::{
         alloc::{self, Layout},
+        ffi::{CString, c_char},
         marker::PhantomData,
-        sync::OnceLock,
+        mem,
+        ptr::{self, NonNull},
+        sync::{Mutex, OnceLock},
     },
     wit_dylib_ffi::{
         self as wit, Call, ExportFunction, Interpreter, List, Wit, WitOption, WitResult,
     },
 };
 
+mod bindings {
+    wit_bindgen::generate!({
+        world: "init",
+        path: "../init.wit",
+        generate_all,
+        disable_run_ctors_once_workaround: true,
+    });
+
+    use super::MyExports;
+
+    export!(MyExports);
+}
+
 static WIT: OnceLock<Wit> = OnceLock::new();
 
 struct Borrow;
-struct Object;
 struct EmptyResource;
+
+struct SyncSend<T>(T);
+
+unsafe impl<T> Sync for SyncSend<T> {}
+unsafe impl<T> Send for SyncSend<T> {}
+
+static RUNTIME: Mutex<Option<SyncSend<Runtime>>> = Mutex::new(None);
+static GLOBAL_OBJECT: OnceLock<SyncSend<NonNull<JSObject>>> = OnceLock::new();
+
+fn make_runtime() -> anyhow::Result<Runtime> {
+    let engine = JSEngine::init()
+        .map_err(|e| anyhow!("{e:?}"))
+        .context("JSEngine::init failed")?;
+
+    let mut runtime = Runtime::new(engine.handle());
+
+    mem::forget(engine);
+
+    let cx = runtime.cx();
+
+    let realm_options = RealmOptions::default();
+
+    let principals = unsafe {
+        let raw = CreateRustJSPrincipals(
+            &JSPrincipalsCallbacks {
+                write: None,
+                isSystemOrAddonPrincipal: None,
+            },
+            ptr::null_mut(),
+        );
+        JS_InitDestroyPrincipalsCallback(cx, Some(DestroyRustJSPrincipals));
+        JS_HoldPrincipals(raw);
+        raw
+    };
+
+    let global_class_ops = Box::into_raw(Box::new(JSClassOps {
+        addProperty: None,
+        delProperty: None,
+        enumerate: None,
+        newEnumerate: None,
+        resolve: None,
+        mayResolve: None,
+        finalize: None,
+        call: None,
+        construct: None,
+        trace: None,
+    }));
+
+    let global_class = Box::into_raw(Box::new(JSClass {
+        name: c"GlobalObject".as_ptr(),
+        flags: JSCLASS_GLOBAL_FLAGS,
+        cOps: global_class_ops,
+        spec: ptr::null(),
+        ext: ptr::null(),
+        oOps: ptr::null(),
+    }));
+
+    let global_object = NonNull::new(unsafe {
+        JS_NewGlobalObject(
+            cx,
+            global_class,
+            principals,
+            OnNewGlobalHookOption::DontFireOnNewGlobalHook,
+            &*realm_options,
+        )
+    })
+    .unwrap();
+
+    GLOBAL_OBJECT
+        .set(SyncSend(global_object))
+        .map_err(drop)
+        .unwrap();
+
+    Ok(runtime)
+}
+
+fn with_context<T: 'static>(fun: impl FnOnce(&mut JSContext) -> T) -> T {
+    let mut runtime = RUNTIME.lock().unwrap();
+    if runtime.is_none() {
+        *runtime = Some(SyncSend(make_runtime().unwrap()));
+    }
+
+    let runtime = &mut runtime.as_mut().unwrap().0;
+    let mut realm = AutoRealm::new(runtime.cx(), GLOBAL_OBJECT.get().unwrap().0);
+    fun(&mut realm)
+}
+
+fn init(script: &str) -> anyhow::Result<()> {
+    with_context(|cx| {
+        let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
+        let script = script.encode_utf16().collect::<Vec<_>>();
+        let mut script = rust::transform_u16_to_source_text(&script);
+        rooted!(&in(cx) let mut result = UndefinedValue());
+        if !unsafe { Evaluate(cx, compile_options.ptr, &mut script, result.handle_mut()) } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            bail!("Evaluate failed")
+        }
+        Ok(())
+    })
+}
+
+struct MyExports;
+
+impl bindings::Guest for MyExports {
+    fn init(script: String) -> Result<(), String> {
+        let result = init(&script).map_err(|e| format!("{e:?}"));
+
+        // This tells the WASI Preview 1 component adapter to reset its state.
+        // In particular, we want it to forget about any open handles and
+        // re-request the stdio handles at runtime since we'll be running under
+        // a brand new host.
+        #[link(wasm_import_module = "wasi_snapshot_preview1")]
+        unsafe extern "C" {
+            #[link_name = "reset_adapter_state"]
+            fn reset_adapter_state();
+        }
+
+        // This tells wasi-libc to reset its preopen state, forcing
+        // re-initialization at runtime.
+        #[link(wasm_import_module = "env")]
+        unsafe extern "C" {
+            #[link_name = "__wasilibc_reset_preopens"]
+            fn wasilibc_reset_preopens();
+        }
+
+        unsafe {
+            reset_adapter_state();
+            wasilibc_reset_preopens();
+        }
+
+        result
+    }
+}
 
 struct MyInterpreter;
 
 impl MyInterpreter {
-    fn export_call_(func: ExportFunction, cx: &mut MyCall<'_>, async_: bool) -> u32 {
-        _ = (func, cx, async_);
-        todo!()
+    fn export_call_(func: ExportFunction, call: &mut MyCall<'_>, async_: bool) -> u32 {
+        if async_ {
+            todo!()
+        }
+
+        let name = || {
+            if let Some(interface) = func.interface() {
+                format!("{interface}#{}", func.name())
+            } else {
+                func.name().into()
+            }
+        };
+
+        with_context(|cx| {
+            rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+            rooted!(&in(cx) let mut object = ptr::null_mut::<JSObject>());
+
+            if let Some(interface) = func.interface() {
+                rooted!(&in(cx) let mut value = UndefinedValue());
+                if !unsafe {
+                    JS_GetProperty(
+                        cx,
+                        global_object.handle(),
+                        CString::new(interface.replace([':', '/', '-'], "_"))
+                            .unwrap()
+                            .as_bytes_with_nul()
+                            .as_ptr() as *const c_char,
+                        value.handle_mut(),
+                    )
+                } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_GetProperty failed for {}", name())
+                }
+                if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_ValueToObject failed for {}", name())
+                }
+            } else {
+                object.set(global_object.get());
+            }
+
+            rooted!(&in(cx) let mut function = UndefinedValue());
+            if !unsafe {
+                JS_GetProperty(
+                    cx,
+                    object.handle(),
+                    CString::new(func.name())
+                        .unwrap()
+                        .as_bytes_with_nul()
+                        .as_ptr() as *const c_char,
+                    function.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_GetProperty failed for {}", name())
+            }
+
+            rooted!(&in(cx) let params = mem::take(&mut call.stack));
+            rooted!(&in(cx) let mut result = UndefinedValue());
+            if !unsafe {
+                JS_CallFunctionValue(
+                    cx,
+                    object.handle(),
+                    function.handle(),
+                    &HandleValueArray::from(&params),
+                    result.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_CallFunctionValue failed for {}", name())
+            }
+
+            if func.result().is_some() {
+                call.stack.push(result.get());
+            }
+
+            0
+        })
     }
 }
 
@@ -69,12 +314,12 @@ struct MyCall<'a> {
     deferred_deallocations: Vec<(*mut u8, Layout)>,
     strings: Vec<String>,
     borrows: Vec<Borrow>,
-    stack: Vec<Object>,
+    stack: Vec<Value>,
     resources: Option<Vec<EmptyResource>>,
 }
 
 impl MyCall<'_> {
-    fn new(stack: Vec<Object>) -> Self {
+    fn new(stack: Vec<Value>) -> Self {
         Self {
             _phantom: PhantomData,
             iter_stack: Vec::new(),
@@ -111,7 +356,7 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_u32(&mut self) -> u32 {
-        todo!()
+        self.stack.pop().unwrap().to_int32() as u32
     }
 
     fn pop_u64(&mut self) -> u64 {
@@ -253,8 +498,7 @@ impl Call for MyCall<'_> {
     }
 
     fn push_u32(&mut self, val: u32) {
-        _ = val;
-        todo!()
+        self.stack.push(UInt32Value(val));
     }
 
     fn push_s32(&mut self, val: i32) {
