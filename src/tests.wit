@@ -1,4 +1,4 @@
-package componentize-js:test;
+package componentize-js:tests;
 
 interface simple-export {
   foo: func(v: u32) -> u32;

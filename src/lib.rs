@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 use {
     anyhow::{Context as _, anyhow},
     bytes::Bytes,
@@ -24,7 +26,7 @@ wasmtime::component::bindgen!({
 #[cfg(test)]
 mod tests;
 
-struct Ctx {
+pub struct Ctx {
     wasi: WasiCtx,
     table: ResourceTable,
 }
@@ -38,7 +40,12 @@ impl WasiView for Ctx {
     }
 }
 
-pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::Result<Vec<u8>> {
+pub async fn componentize(
+    wit: &str,
+    world: Option<&str>,
+    js: &str,
+    add_to_linker: Option<&dyn Fn(&mut Linker<Ctx>) -> anyhow::Result<()>>,
+) -> anyhow::Result<Vec<u8>> {
     let mut resolve = Resolve::default();
     let package = resolve.push_str("wit", wit)?;
     let world = resolve.select_world(&[package], world)?;
@@ -132,7 +139,12 @@ pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::R
     let component = Component::new(&engine, &component)?;
 
     let mut linker = Linker::new(&engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    if let Some(add_to_linker) = add_to_linker {
+        add_to_linker(&mut linker)?;
+    } else {
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    }
+
     let instance = linker.instantiate_async(&mut store, &component).await?;
     {
         let instance = Init::new(&mut store, &instance)?;
