@@ -1,7 +1,8 @@
 use {
     anyhow::{Context as _, anyhow},
     bytes::Bytes,
-    std::io::Cursor,
+    std::{borrow::Cow, io::Cursor},
+    wasm_encoder::{CustomSection, Section as _},
     wasmtime::{
         Config, Engine, Store,
         component::{Component, Linker, ResourceTable},
@@ -9,6 +10,7 @@ use {
     wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView},
     wasmtime_wizer::{WasmtimeWizerComponent, Wizer},
+    wit_component::metadata,
     wit_dylib::DylibOpts,
     wit_parser::Resolve,
 };
@@ -41,7 +43,7 @@ pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::R
     let package = resolve.push_str("wit", wit)?;
     let world = resolve.select_world(&[package], world)?;
 
-    let bindings = wit_dylib::create(
+    let mut bindings = wit_dylib::create(
         &resolve,
         world,
         Some(&mut DylibOpts {
@@ -49,6 +51,17 @@ pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::R
             async_: Default::default(),
         }),
     );
+
+    CustomSection {
+        name: Cow::Borrowed("component-type:componentize-js"),
+        data: Cow::Owned(metadata::encode(
+            &resolve,
+            world,
+            wit_component::StringEncoding::UTF8,
+            None,
+        )?),
+    }
+    .append_to(&mut bindings);
 
     let component = {
         let mut linker = wit_component::Linker::default()
@@ -136,7 +149,7 @@ pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::R
             })?;
     }
 
-    wizer
+    let component = wizer
         .snapshot_component(
             cx,
             &mut WasmtimeWizerComponent {
@@ -144,5 +157,9 @@ pub async fn componentize(wit: &str, world: Option<&str>, js: &str) -> anyhow::R
                 instance,
             },
         )
-        .await
+        .await?;
+
+    tokio::fs::write("/tmp/foo.wasm", &component).await?;
+
+    Ok(component)
 }
