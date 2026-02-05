@@ -16,7 +16,7 @@ use {
 
 const STRIP_RUNTIME: bool = true;
 
-const ZSTD_COMPRESSION_LEVEL: i32 = 19;
+const ZSTD_COMPRESSION_LEVEL: i32 = 0;
 
 #[cfg(target_os = "windows")]
 const CLANG_EXECUTABLE: &str = "clang.exe";
@@ -124,7 +124,6 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<(
         .arg("build")
         .arg("-Z")
         .arg("build-std=panic_abort,std")
-        .arg("--release")
         .arg("--target=wasm32-wasip1");
 
     for (key, _) in env::vars_os() {
@@ -145,7 +144,7 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<(
     assert!(status.success());
     println!("cargo:rerun-if-changed=runtime");
 
-    let path = out_dir.join("wasm32-wasip1/release/libcomponentize_js_runtime.a");
+    let path = out_dir.join("wasm32-wasip1/debug/libcomponentize_js_runtime.a");
 
     if path.exists() {
         let clang = wasi_sdk.join(format!("bin/{CLANG_EXECUTABLE}"));

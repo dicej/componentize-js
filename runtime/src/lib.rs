@@ -8,7 +8,10 @@ use {
     anyhow::{Context as _, anyhow, bail},
     mozjs::{
         context::JSContext,
-        glue::{CreateRustJSPrincipals, JSPrincipalsCallbacks},
+        glue::{
+            CreateRustJSPrincipals, DestroyRustJSPrincipals, JSPrincipalsCallbacks,
+            PrintAndClearException,
+        },
         jsapi::{
             JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSPrincipals,
             OnNewGlobalHookOption,
@@ -18,7 +21,9 @@ use {
         rooted,
         rust::{
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
-            wrappers2::{Evaluate, JS_DropPrincipals, JS_NewGlobalObject},
+            wrappers2::{
+                Evaluate, JS_DropPrincipals, JS_InitDestroyPrincipalsCallback, JS_NewGlobalObject,
+            },
         },
     },
     std::{
@@ -37,6 +42,7 @@ mod bindings {
         world: "init",
         path: "../init.wit",
         generate_all,
+        disable_run_ctors_once_workaround: true,
     });
 
     use super::MyExports;
@@ -84,6 +90,9 @@ fn init(script: &str) -> anyhow::Result<()> {
         .context("JSEngine::init failed")?;
     let mut runtime = Runtime::new(engine.handle());
     let cx = runtime.cx();
+    unsafe {
+        JS_InitDestroyPrincipalsCallback(cx, Some(DestroyRustJSPrincipals));
+    }
     let realm_options = RealmOptions::default();
     let principals = Principals::new(cx);
     let global_class_ops = JSClassOps {
@@ -117,10 +126,10 @@ fn init(script: &str) -> anyhow::Result<()> {
     })
     .unwrap();
     let mut realm = AutoRealm::new(principals.cx, global_object);
-    let compile_options = CompileOptionsWrapper::new(&realm, "script", 1);
-    let mut script = rust::transform_u16_to_source_text(&script.encode_utf16().collect::<Vec<_>>());
+    let compile_options = CompileOptionsWrapper::new(&realm, c"script".into(), 1);
+    let script = script.encode_utf16().collect::<Vec<_>>();
+    let mut script = rust::transform_u16_to_source_text(&script);
     rooted!(&in(&mut realm) let mut result = UndefinedValue());
-    // TODO: check for thrown exception?
     if !unsafe {
         Evaluate(
             &mut realm,
@@ -129,6 +138,8 @@ fn init(script: &str) -> anyhow::Result<()> {
             result.handle_mut(),
         )
     } {
+        unsafe { PrintAndClearException(realm.raw_cx()) }
+
         bail!("Evaluate failed")
     }
     Ok(())
