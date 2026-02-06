@@ -40,6 +40,7 @@ impl WasiView for Ctx {
     }
 }
 
+#[expect(clippy::type_complexity)]
 pub async fn componentize(
     wit: &str,
     world: Option<&str>,

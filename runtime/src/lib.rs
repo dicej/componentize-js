@@ -14,9 +14,9 @@ use {
         },
         jsapi::{
             JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSPrincipals,
-            OnNewGlobalHookOption,
+            OnNewGlobalHookOption, Value,
         },
-        jsval::UndefinedValue,
+        jsval::{UInt32Value, UndefinedValue},
         realm::AutoRealm,
         rooted,
         rust::{
@@ -53,7 +53,6 @@ mod bindings {
 static WIT: OnceLock<Wit> = OnceLock::new();
 
 struct Borrow;
-struct Object;
 struct EmptyResource;
 
 struct Principals<'a> {
@@ -182,8 +181,74 @@ struct MyInterpreter;
 
 impl MyInterpreter {
     fn export_call_(func: ExportFunction, cx: &mut MyCall<'_>, async_: bool) -> u32 {
-        _ = (func, cx, async_);
-        todo!()
+        if async_ {
+            todo!()
+        }
+
+        let prefix = || {
+            if let Some(interface) = func.interface() {
+                format!("{interface}#")
+            } else {
+                String::new()
+            }
+        };
+
+        let cx = CONTEXT.lock().unwrap();
+        rooted!(&in(cx) let global_object = CurrentGlobalOrNull(cx));
+        rooted!(&in(cx) let mut object = ptr::null_mut());
+
+        if let Some(interface) = func.interface() {
+            rooted!(&in(cx) let mut value = UndefinedValue());
+            if !unsafe {
+                JS_GetProperty(
+                    cx,
+                    global_object.handle(),
+                    CString::new(interface.replace([':', '/', '-'], "_")).as_bytes(),
+                    value.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(realm.raw_cx()) }
+                panic!("JS_GetProperty failed for {}{name}", prefix())
+            }
+            if !unsafe { JS_ValueToObject(cx, value, object.handle_mut()) } {
+                unsafe { PrintAndClearException(realm.raw_cx()) }
+                panic!("JS_ValueToObject failed for {}{name}", prefix())
+            }
+        } else {
+            object.set(global_object.get());
+        }
+
+        rooted!(&in(cx) let mut function = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                object.handle(),
+                CString::new(func.name()).as_bytes(),
+                function.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(realm.raw_cx()) }
+            panic!("JS_GetProperty failed for {}{name}", prefix())
+        }
+
+        rooted_vec!(&in(cx) let params <- mem::take(&mut cx.stack).into_iter());
+        rooted!(&in(cx) let mut result = UndefinedValue());
+        if !unsafe {
+            JS_CallFunctionValue(
+                cx,
+                object.handle(),
+                function.handle(),
+                HandleValueArray::from(params),
+                result.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(realm.raw_cx()) }
+            panic!("JS_CallFunctionValue failed for {}{name}", prefix())
+        }
+
+        if func.result().is_some() {
+            cx.stack.push(result.get());
+        }
     }
 }
 
@@ -226,12 +291,12 @@ struct MyCall<'a> {
     deferred_deallocations: Vec<(*mut u8, Layout)>,
     strings: Vec<String>,
     borrows: Vec<Borrow>,
-    stack: Vec<Object>,
+    stack: Vec<Value>,
     resources: Option<Vec<EmptyResource>>,
 }
 
 impl MyCall<'_> {
-    fn new(stack: Vec<Object>) -> Self {
+    fn new(stack: Vec<Value>) -> Self {
         Self {
             _phantom: PhantomData,
             iter_stack: Vec::new(),
@@ -268,7 +333,7 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_u32(&mut self) -> u32 {
-        todo!()
+        self.stack.pop().unwrap().to_int32() as u32
     }
 
     fn pop_u64(&mut self) -> u64 {
@@ -410,8 +475,7 @@ impl Call for MyCall<'_> {
     }
 
     fn push_u32(&mut self, val: u32) {
-        _ = val;
-        todo!()
+        self.stack.push(UInt32Value(val));
     }
 
     fn push_s32(&mut self, val: i32) {
