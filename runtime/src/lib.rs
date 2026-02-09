@@ -9,12 +9,12 @@ use {
     mozjs::{
         context::JSContext,
         glue::{
-            CreateRustJSPrincipals, DestroyRustJSPrincipals, JSPrincipalsCallbacks,
-            PrintAndClearException,
+            CallObjectTracer, CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
+            JSPrincipalsCallbacks, PrintAndClearException,
         },
         jsapi::{
-            HandleValueArray, JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps,
-            JSObject, OnNewGlobalHookOption, Value,
+            GCTraceKindToAscii, HandleValueArray, Heap, JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS,
+            JSClass, JSClassOps, JSObject, JSTracer, OnNewGlobalHookOption, TraceKind, Value,
         },
         jsval::{UInt32Value, UndefinedValue},
         realm::AutoRealm,
@@ -22,18 +22,22 @@ use {
         rust::{
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
             wrappers2::{
-                CurrentGlobalOrNull, Evaluate, JS_CallFunctionValue, JS_GetProperty,
-                JS_InitDestroyPrincipalsCallback, JS_NewGlobalObject, JS_ValueToObject,
+                CurrentGlobalOrNull, Evaluate, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
+                JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewGlobalObject,
+                JS_ValueToObject,
             },
         },
     },
     std::{
         alloc::{self, Layout},
-        ffi::{CString, c_char},
+        collections::HashSet,
+        ffi::{CString, c_char, c_void},
+        hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
         marker::PhantomData,
         mem,
+        ops::DerefMut,
         ptr::{self, NonNull},
-        sync::{Mutex, OnceLock},
+        sync::{Arc, Mutex, OnceLock},
     },
     wit_dylib_ffi::{
         self as wit, Call, ExportFunction, Interpreter, List, Wit, WitOption, WitResult,
@@ -63,8 +67,30 @@ struct SyncSend<T>(T);
 unsafe impl<T> Sync for SyncSend<T> {}
 unsafe impl<T> Send for SyncSend<T> {}
 
+struct ArcHash<T>(Arc<T>);
+
+impl<T> Hash for ArcHash<T> {
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        (Arc::as_ptr(&self.0) as usize).hash(state)
+    }
+}
+
+impl<T> PartialEq for ArcHash<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Eq for ArcHash<T> {}
+
+type Stacks = HashSet<ArcHash<Mutex<Vec<Box<Heap<Value>>>>>, BuildHasherDefault<DefaultHasher>>;
+
 static RUNTIME: Mutex<Option<SyncSend<Runtime>>> = Mutex::new(None);
-static GLOBAL_OBJECT: OnceLock<SyncSend<NonNull<JSObject>>> = OnceLock::new();
+static GLOBAL_OBJECT: Mutex<Option<SyncSend<Box<Heap<*mut JSObject>>>>> = Mutex::new(None);
+static STACKS: Mutex<Stacks> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
 
 fn make_runtime() -> anyhow::Result<Runtime> {
     let engine = JSEngine::init()
@@ -76,6 +102,10 @@ fn make_runtime() -> anyhow::Result<Runtime> {
     mem::forget(engine);
 
     let cx = runtime.cx();
+
+    unsafe {
+        JS_AddExtraGCRootsTracer(cx, Some(trace_roots), ptr::null_mut());
+    }
 
     let realm_options = RealmOptions::default();
 
@@ -114,7 +144,7 @@ fn make_runtime() -> anyhow::Result<Runtime> {
         oOps: ptr::null(),
     }));
 
-    let global_object = NonNull::new(unsafe {
+    *GLOBAL_OBJECT.try_lock().unwrap() = Some(SyncSend(Heap::boxed(unsafe {
         JS_NewGlobalObject(
             cx,
             global_class,
@@ -122,13 +152,7 @@ fn make_runtime() -> anyhow::Result<Runtime> {
             OnNewGlobalHookOption::DontFireOnNewGlobalHook,
             &*realm_options,
         )
-    })
-    .unwrap();
-
-    GLOBAL_OBJECT
-        .set(SyncSend(global_object))
-        .map_err(drop)
-        .unwrap();
+    })));
 
     Ok(runtime)
 }
@@ -140,7 +164,10 @@ fn with_context<T: 'static>(fun: impl FnOnce(&mut JSContext) -> T) -> T {
     }
 
     let runtime = &mut runtime.as_mut().unwrap().0;
-    let mut realm = AutoRealm::new(runtime.cx(), GLOBAL_OBJECT.get().unwrap().0);
+    let mut realm = AutoRealm::new(
+        runtime.cx(),
+        NonNull::new(GLOBAL_OBJECT.try_lock().unwrap().as_ref().unwrap().0.get()).unwrap(),
+    );
     fun(&mut realm)
 }
 
@@ -251,7 +278,11 @@ impl MyInterpreter {
                 panic!("JS_GetProperty failed for {}", name())
             }
 
-            rooted!(&in(cx) let params = mem::take(&mut call.stack));
+            let params = mem::take(call.stack.try_lock().unwrap().deref_mut())
+                .into_iter()
+                .map(|v| v.get())
+                .collect::<Vec<_>>();
+            rooted!(&in(cx) let params = params);
             rooted!(&in(cx) let mut result = UndefinedValue());
             if !unsafe {
                 JS_CallFunctionValue(
@@ -267,7 +298,10 @@ impl MyInterpreter {
             }
 
             if func.result().is_some() {
-                call.stack.push(result.get());
+                call.stack
+                    .try_lock()
+                    .unwrap()
+                    .push(Heap::boxed(result.get()));
             }
 
             0
@@ -283,7 +317,7 @@ impl Interpreter for MyInterpreter {
     }
 
     fn export_start<'a>(_: Wit, _: ExportFunction) -> Box<MyCall<'a>> {
-        Box::new(MyCall::new(Vec::new()))
+        Box::new(MyCall::new())
     }
 
     fn export_call(_: Wit, func: ExportFunction, cx: &mut MyCall<'_>) {
@@ -307,19 +341,21 @@ impl Interpreter for MyInterpreter {
     }
 }
 
-#[expect(dead_code)]
+#[expect(dead_code, clippy::vec_box)]
 struct MyCall<'a> {
     _phantom: PhantomData<&'a ()>,
     iter_stack: Vec<usize>,
     deferred_deallocations: Vec<(*mut u8, Layout)>,
     strings: Vec<String>,
     borrows: Vec<Borrow>,
-    stack: Vec<Value>,
+    stack: Arc<Mutex<Vec<Box<Heap<Value>>>>>,
     resources: Option<Vec<EmptyResource>>,
 }
 
 impl MyCall<'_> {
-    fn new(stack: Vec<Value>) -> Self {
+    fn new() -> Self {
+        let stack = Arc::new(Mutex::new(Vec::new()));
+        assert!(STACKS.try_lock().unwrap().insert(ArcHash(stack.clone())));
         Self {
             _phantom: PhantomData,
             iter_stack: Vec::new(),
@@ -334,6 +370,13 @@ impl MyCall<'_> {
 
 impl Drop for MyCall<'_> {
     fn drop(&mut self) {
+        assert!(
+            STACKS
+                .try_lock()
+                .unwrap()
+                .remove(&ArcHash(self.stack.clone()))
+        );
+
         for &(ptr, layout) in &self.deferred_deallocations {
             unsafe {
                 alloc::dealloc(ptr, layout);
@@ -356,7 +399,13 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_u32(&mut self) -> u32 {
-        self.stack.pop().unwrap().to_int32() as u32
+        self.stack
+            .try_lock()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .get()
+            .to_int32() as u32
     }
 
     fn pop_u64(&mut self) -> u64 {
@@ -498,7 +547,10 @@ impl Call for MyCall<'_> {
     }
 
     fn push_u32(&mut self, val: u32) {
-        self.stack.push(UInt32Value(val));
+        self.stack
+            .try_lock()
+            .unwrap()
+            .push(Heap::boxed(UInt32Value(val)));
     }
 
     fn push_s32(&mut self, val: i32) {
@@ -601,6 +653,37 @@ impl Call for MyCall<'_> {
 }
 
 wit_dylib_ffi::export!(MyInterpreter);
+
+unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
+    unsafe {
+        CallObjectTracer(
+            tracer,
+            GLOBAL_OBJECT
+                .try_lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .0
+                .ptr
+                .get() as *mut _,
+            GCTraceKindToAscii(TraceKind::Object),
+        )
+    }
+
+    for stack in STACKS.try_lock().unwrap().iter() {
+        for value in stack.0.try_lock().unwrap().iter_mut() {
+            if value.get().is_markable() {
+                unsafe {
+                    CallValueTracer(
+                        tracer,
+                        value.ptr.get() as *mut _,
+                        GCTraceKindToAscii(value.get().trace_kind()),
+                    )
+                }
+            }
+        }
+    }
+}
 
 // As of this writing, recent Rust `nightly` builds include a version of the
 // `libc` crate that expects `wasi-libc` to define the following global
