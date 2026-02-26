@@ -9,7 +9,7 @@ crate-type = ["staticlib"]
 [dependencies]
 anyhow = "1.0.100"
 # TODO: upstream patch(es) (or figure out how live without them) and switch this dep to upstream
-mozjs = { git = "https://github.com/dicej/mozjs", rev = "0dfa831a", default-features = false, features = ["libz-sys"] }
+mozjs = { git = "https://github.com/dicej/mozjs", rev = "1a93a3ef", default-features = false, features = ["libz-sys"] }
 wit-bindgen = { version = "0.52.0", default-features = false, features = ["macros", "realloc"] }
 # TODO: switch to a release when available:
 wit-dylib-ffi = { git = "https://github.com/dicej/wasm-tools", rev = "b072b0ca", features = ["async-raw"] }

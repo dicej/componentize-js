@@ -1,6 +1,6 @@
 use {
     super::Ctx,
-    std::{sync::LazyLock, time::Duration},
+    std::sync::LazyLock,
     tokio::sync::OnceCell,
     wasmtime::{
         Config, Engine, Store,
@@ -15,8 +15,6 @@ wasmtime::component::bindgen!({
     imports: { default: async | trappable },
     exports: { default: async | task_exit },
 });
-
-const DELAY: Duration = Duration::from_millis(100);
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = Config::new();
@@ -77,6 +75,31 @@ async fn simple_export() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn simple_async_export() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        42 + 3,
+        store
+            .run_concurrent(async |accessor| {
+                instance
+                    .componentize_js_tests_simple_async_export()
+                    .call_foo(accessor, 42)
+                    .await
+            })
+            .await??
+            .0
+    );
+    Ok(())
+}
+
+impl componentize_js::tests::simple_import_and_export::Host for Ctx {
+    async fn foo(&mut self, v: u32) -> anyhow::Result<u32> {
+        Ok(v + 2)
+    }
+}
+
+#[tokio::test]
 async fn simple_import_and_export() -> anyhow::Result<()> {
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
@@ -90,17 +113,32 @@ async fn simple_import_and_export() -> anyhow::Result<()> {
     Ok(())
 }
 
-impl componentize_js::tests::simple_import_and_export::Host for Ctx {
-    async fn foo(&mut self, v: u32) -> anyhow::Result<u32> {
-        Ok(v + 2)
-    }
-}
-
 impl componentize_js::tests::simple_async_import_and_export::Host for Ctx {}
 
 impl componentize_js::tests::simple_async_import_and_export::HostWithStore for HasSelf<Ctx> {
     async fn foo<T>(_: &Accessor<T, Self>, v: u32) -> anyhow::Result<u32> {
-        tokio::time::sleep(DELAY).await;
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
         Ok(v + 2)
     }
+}
+
+#[tokio::test]
+async fn simple_async_import_and_export() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        42 + 3 + 2,
+        store
+            .run_concurrent(async |accessor| {
+                instance
+                    .componentize_js_tests_simple_async_import_and_export()
+                    .call_foo(accessor, 42)
+                    .await
+            })
+            .await??
+            .0
+    );
+    Ok(())
 }
