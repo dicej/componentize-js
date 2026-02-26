@@ -173,7 +173,7 @@ fn with_context<T: 'static>(fun: impl FnOnce(&mut JSContext) -> T) -> T {
 }
 
 unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
-    assert_eq!(argc, 2);
+    assert!(argc >= 2);
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
 
@@ -182,6 +182,8 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let params = args.index(1);
     rooted!(&in(cx) let params = params.to_object());
     rooted!(&in(cx) let mut length = UndefinedValue());
+    // TODO: Is there a quicker way to get the array length, e.g. using
+    // `JS_GetPropertyById`?
     if !unsafe {
         JS_GetProperty(
             cx,
@@ -191,7 +193,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
         )
     } {
         unsafe { PrintAndClearException(cx.raw_cx()) }
-        panic!("JS_GetProperty failed for length")
+        panic!("JS_GetProperty failed for `length`")
     }
 
     let length = u32::try_from(length.to_int32()).unwrap();
@@ -206,7 +208,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
         rooted!(&in(cx) let mut value = UndefinedValue());
         if !unsafe { JS_GetElement(cx, params.handle(), index, value.handle_mut()) } {
             unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for {index}")
+            panic!("JS_GetProperty failed for `{index}`")
         }
         call.stack
             .try_lock()
@@ -215,8 +217,49 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     }
 
     if func.is_async() {
-        todo!();
+        assert_eq!(argc, 4);
+
+        let resolve = args.index(2);
+        let reject = args.index(3);
+
+        if let Some(pending) = func.call_import_async(call) {
+            let state = CURRENT_TASK_STATE.try_lock().unwrap().as_mut().unwrap();
+            state.pending.insert(
+                pending.subtask,
+                Promise::ImportCall {
+                    index,
+                    call,
+                    buffer: pending.buffer,
+                    resolve: Heap::boxed(resolve),
+                    reject: Heap::boxed(reject),
+                },
+            );
+        } else {
+            rooted!(&in(cx) let result = UndefinedValue());
+            if func.result.is_some() {
+                result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
+            }
+            rooted!(&in(cx) let params = vec![result.get()]);
+            rooted!(&in(cx) let object = UndefinedValue());
+            rooted!(&in(cx) let result = UndefinedValue());
+            if !unsafe {
+                JS_CallFunctionValue(
+                    cx,
+                    object.handle(),
+                    resolve.handle(),
+                    &HandleValueArray::from(&params),
+                    result.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_CallFunctionValue failed for `{}`", name())
+            }
+        }
+
+        args.rval(UndefinedValue())
     } else {
+        assert_eq!(argc, 2);
+
         func.call_import_sync(&mut call);
         if func.result().is_some() {
             args.rval()
@@ -230,15 +273,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
 fn init(script: &str) -> anyhow::Result<()> {
     with_context(|cx| {
         // First, add `call_import` to the global object.
-        let call_import = unsafe {
-            JS_NewFunction(
-                cx,
-                Some(call_import),
-                2,
-                0,
-                c"componentize_js_call_import".as_ptr() as *const c_char,
-            )
-        };
+        let call_import = unsafe { JS_NewFunction(cx, Some(call_import), 2, 0, ptr::null()) };
         rooted!(&in(cx) let mut call_import = ObjectValue(unsafe {
             JS_GetFunctionObject(call_import)
         }));
@@ -258,6 +293,10 @@ fn init(script: &str) -> anyhow::Result<()> {
         // Next, generate JS code which will add an `imports` property to the
         // global object containing any and all imported functions, each of
         // which will forward their parameters to `call_import`.
+        //
+        // TODO: Move this code to the host side of `componentize-js` and
+        // thereby avoid creating a lot of temporary guest allocations that get
+        // baked into the pre-init snapshot but never used at runtime.
         let mut imports = BTreeMap::<_, Vec<_>>::new();
         for (index, func) in WIT.get().unwrap().iter_import_funcs().enumerate() {
             imports
@@ -266,23 +305,96 @@ fn init(script: &str) -> anyhow::Result<()> {
                 .push((index, func));
         }
 
-        let imports = imports.into_iter().map(|(interface, funcs)| {
-            let funcs = funcs.into_iter().map(|(index, func)| {
-                let name = func.name().replace('-', "_");
-                let params = (0..func.params().len()).map(|i| format!("p{i}")).collect::<Vec<_>>().join(",");
-                format!("{name}:function({params}){{return componentize_js_call_import({index}, [{params}])}}")
-            }).collect::<Vec<_>>().join(",");
-            if let Some(interface) = interface {
-                let name = interface.replace([':', '/', '-'], "_");
-                format!("{name}:{{{funcs}}}")
-            } else {
-                funcs
-            }
-        }).collect::<Vec<_>>().join(",");
+        let imports = imports
+            .into_iter()
+            .map(|(interface, funcs)| {
+                let funcs = funcs
+                    .into_iter()
+                    .map(|(index, func)| {
+                        let name = func.name().replace('-', "_");
+                        let params = (0..func.params().len())
+                            .map(|i| format!("p{i}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let value = if func.is_async() {
+                            format!(
+                                "new Promise((a,b)=>\
+                                 componentize_js_call_import({index},[{params}],a,b)"
+                            )
+                        } else {
+                            format!("componentize_js_call_import({index},[{params}])")
+                        };
+                        format!("{name}:function({params}){{return {value}}}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                if let Some(interface) = interface {
+                    let name = interface.replace([':', '/', '-'], "_");
+                    format!("{name}:{{{funcs}}}")
+                } else {
+                    funcs
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Next, generate JS code which will add a
+        // `componentize_js_async_exports` property to the global object which
+        // will wrap any and all async exports defined in the script so that
+        // they call back into Rust when the promises resolve.
+        //
+        // TODO: As above, move this code to the host side of `componentize-js`.
+        let mut exports = BTreeMap::<_, Vec<_>>::new();
+        for (index, func) in WIT.get().unwrap().iter_export_funcs().enumerate() {
+            // TODO: As of this writing `wit-dylib`, won't tell us which
+            // functions are async, so here we conservatively generate async
+            // wrappers for all of them; the wrappers for the sync functions
+            // won't actually be used.  Once we move this code to the host side,
+            // we'll have that information and can be more precise.
+            imports
+                .entry(func.interface())
+                .or_default()
+                .push((index, func));
+        }
+
+        let exports = exports
+            .into_iter()
+            .map(|(interface, funcs)| {
+                let interface = interface.map(|v| v.replace([':', '/', '-'], "_"));
+                let funcs = exports
+                    .into_iter()
+                    .map(|(index, func)| {
+                        let interface = interface.map(|v| format!("{v}."));
+                        let name = func.name().replace('-', "_");
+                        let params = (0..func.params().len())
+                            .map(|i| format!(",p{i}"))
+                            .collect::<Vec<_>>()
+                            .concat();
+                        format!(
+                            "{name}:function({params}){{\
+                             return exports.{interface}{name}({params})\
+                             .then((a,b)=>componentize_js_resolve({index},a,b)))\
+                             }}"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                if let Some(interface) = interface {
+                    format!("{interface}:{{{funcs}}}")
+                } else {
+                    funcs
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
 
         // Finally, append the generated code to the script and execute the
         // result.
-        let script = format!("{script}\nvar imports = {{{imports}}}");
+        let script = format!(
+            "{script}\nvar imports = {{{imports}}}\nvar componentize_js_async_exports = {{{imports}}}"
+        );
         let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
         let script = script.encode_utf16().collect::<Vec<_>>();
         let mut script = rust::transform_u16_to_source_text(&script);
@@ -293,6 +405,24 @@ fn init(script: &str) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+fn poll(cx: &mut JSContext) -> u32 {
+    unsafe { RunJobs(cx) }
+
+    let state = CURRENT_TASK_STATE.try_lock().unwrap().take().unwrap();
+    if state.pending.is_empty() {
+        if let Some(set) = state.waitable_set.take() {
+            waitable_set_drop(set);
+        }
+
+        CALLBACK_CODE_EXIT
+    } else {
+        let set = state.waitable_set.unwrap();
+        context_set(Box::into_raw(state));
+
+        CALLBACK_CODE_WAIT | (set << 4)
+    }
 }
 
 struct MyExports;
@@ -332,10 +462,6 @@ struct MyInterpreter;
 
 impl MyInterpreter {
     fn export_call_(func: ExportFunction, call: &mut MyCall<'_>, async_: bool) -> u32 {
-        if async_ {
-            todo!()
-        }
-
         let name = || {
             if let Some(interface) = func.interface() {
                 format!("{interface}#{}", func.name())
@@ -343,6 +469,10 @@ impl MyInterpreter {
                 func.name().into()
             }
         };
+
+        if async_ {
+            *CURRENT_TASK_STATE.try_lock().unwrap() = Some(Box::new(TaskState::new()));
+        }
 
         with_context(|cx| {
             rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
@@ -354,16 +484,21 @@ impl MyInterpreter {
                     JS_GetProperty(
                         cx,
                         global_object.handle(),
-                        c"exports".as_ptr() as *const c_char,
+                        if async_ {
+                            c"componentize_js_async_exports"
+                        } else {
+                            c"exports"
+                        }
+                        .as_ptr() as *const c_char,
                         value.handle_mut(),
                     )
                 } {
                     unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_GetProperty failed for {}", name())
+                    panic!("JS_GetProperty failed for `{}`", name())
                 }
                 if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
                     unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_ValueToObject failed for {}", name())
+                    panic!("JS_ValueToObject failed for `{}`", name())
                 }
             }
 
@@ -381,11 +516,11 @@ impl MyInterpreter {
                     )
                 } {
                     unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_GetProperty failed for {}", name())
+                    panic!("JS_GetProperty failed for `{}`", name())
                 }
                 if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
                     unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_ValueToObject failed for {}", name())
+                    panic!("JS_ValueToObject failed for `{}`", name())
                 }
             }
 
@@ -402,7 +537,7 @@ impl MyInterpreter {
                 )
             } {
                 unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetProperty failed for {}", name())
+                panic!("JS_GetProperty failed for `{}`", name())
             }
 
             let params = mem::take(call.stack.try_lock().unwrap().deref_mut())
@@ -421,17 +556,23 @@ impl MyInterpreter {
                 )
             } {
                 unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_CallFunctionValue failed for {}", name())
+                panic!("JS_CallFunctionValue failed for `{}`", name())
             }
 
-            if func.result().is_some() {
-                call.stack
-                    .try_lock()
-                    .unwrap()
-                    .push(Heap::boxed(result.get()));
-            }
+            if async_ {
+                // TODO: Do we need to manually add the returned promise to the
+                // job queue?
+                poll(cx)
+            } else {
+                if func.result().is_some() {
+                    call.stack
+                        .try_lock()
+                        .unwrap()
+                        .push(Heap::boxed(result.get()));
+                }
 
-            0
+                0
+            }
         })
     }
 }
