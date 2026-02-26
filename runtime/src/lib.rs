@@ -13,24 +13,25 @@ use {
             JSPrincipalsCallbacks, PrintAndClearException,
         },
         jsapi::{
-            GCTraceKindToAscii, HandleValueArray, Heap, JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS,
-            JSClass, JSClassOps, JSObject, JSTracer, OnNewGlobalHookOption, TraceKind, Value,
+            GCTraceKindToAscii, HandleValueArray, Heap, JS_CallArgsFromVp, JS_GetFunctionObject,
+            JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps,
+            JSContext as RawJSContext, JSObject, JSTracer, OnNewGlobalHookOption, TraceKind, Value,
         },
-        jsval::{UInt32Value, UndefinedValue},
+        jsval::{ObjectValue, UInt32Value, UndefinedValue},
         realm::AutoRealm,
         rooted,
         rust::{
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
             wrappers2::{
                 CurrentGlobalOrNull, Evaluate, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
-                JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewGlobalObject,
-                JS_ValueToObject,
+                JS_GetElement, JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewFunction,
+                JS_NewGlobalObject, JS_SetProperty, JS_ValueToObject,
             },
         },
     },
     std::{
         alloc::{self, Layout},
-        collections::HashSet,
+        collections::{BTreeMap, HashSet},
         ffi::{CString, c_char, c_void},
         hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
         marker::PhantomData,
@@ -171,8 +172,117 @@ fn with_context<T: 'static>(fun: impl FnOnce(&mut JSContext) -> T) -> T {
     fun(&mut realm)
 }
 
+unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 2);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let index = args.index(0);
+    let params = args.index(1);
+    rooted!(&in(cx) let params = params.to_object());
+    rooted!(&in(cx) let mut length = UndefinedValue());
+    if !unsafe {
+        JS_GetProperty(
+            cx,
+            params.handle(),
+            c"length".as_ptr() as *const c_char,
+            length.handle_mut(),
+        )
+    } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_GetProperty failed for length")
+    }
+
+    let length = u32::try_from(length.to_int32()).unwrap();
+    let func = WIT
+        .get()
+        .unwrap()
+        .import_func(usize::try_from(index.to_int32()).unwrap());
+    assert_eq!(func.params().len(), usize::try_from(length).unwrap());
+
+    let mut call = MyCall::new();
+    for index in 0..length {
+        rooted!(&in(cx) let mut value = UndefinedValue());
+        if !unsafe { JS_GetElement(cx, params.handle(), index, value.handle_mut()) } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for {index}")
+        }
+        call.stack
+            .try_lock()
+            .unwrap()
+            .push(Heap::boxed(value.get()));
+    }
+
+    if func.is_async() {
+        todo!();
+    } else {
+        func.call_import_sync(&mut call);
+        if func.result().is_some() {
+            args.rval()
+                .set(call.stack.try_lock().unwrap().pop().unwrap().get());
+        }
+    }
+
+    true
+}
+
 fn init(script: &str) -> anyhow::Result<()> {
     with_context(|cx| {
+        // First, add `call_import` to the global object.
+        let call_import = unsafe {
+            JS_NewFunction(
+                cx,
+                Some(call_import),
+                2,
+                0,
+                c"componentize_js_call_import".as_ptr() as *const c_char,
+            )
+        };
+        rooted!(&in(cx) let mut call_import = ObjectValue(unsafe {
+            JS_GetFunctionObject(call_import)
+        }));
+        rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+        if !unsafe {
+            JS_SetProperty(
+                cx,
+                global_object.handle(),
+                c"componentize_js_call_import".as_ptr() as *const c_char,
+                call_import.handle(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            bail!("JS_SetProperty failed")
+        }
+
+        // Next, generate JS code which will add an `imports` property to the
+        // global object containing any and all imported functions, each of
+        // which will forward their parameters to `call_import`.
+        let mut imports = BTreeMap::<_, Vec<_>>::new();
+        for (index, func) in WIT.get().unwrap().iter_import_funcs().enumerate() {
+            imports
+                .entry(func.interface())
+                .or_default()
+                .push((index, func));
+        }
+
+        let imports = imports.into_iter().map(|(interface, funcs)| {
+            let funcs = funcs.into_iter().map(|(index, func)| {
+                let name = func.name().replace('-', "_");
+                let params = (0..func.params().len()).map(|i| format!("p{i}")).collect::<Vec<_>>().join(",");
+                format!("{name}:function({params}){{return componentize_js_call_import({index}, [{params}])}}")
+            }).collect::<Vec<_>>().join(",");
+            if let Some(interface) = interface {
+                let name = interface.replace([':', '/', '-'], "_");
+                format!("{name}:{{{funcs}}}")
+            } else {
+                funcs
+            }
+        }).collect::<Vec<_>>().join(",");
+
+        // Finally, append the generated code to the script and execute the
+        // result.
+        let script = format!("{script}\nvar imports = {{{imports}}}");
         let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
         let script = script.encode_utf16().collect::<Vec<_>>();
         let mut script = rust::transform_u16_to_source_text(&script);
@@ -238,12 +348,31 @@ impl MyInterpreter {
             rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
             rooted!(&in(cx) let mut object = ptr::null_mut::<JSObject>());
 
-            if let Some(interface) = func.interface() {
+            {
                 rooted!(&in(cx) let mut value = UndefinedValue());
                 if !unsafe {
                     JS_GetProperty(
                         cx,
                         global_object.handle(),
+                        c"exports".as_ptr() as *const c_char,
+                        value.handle_mut(),
+                    )
+                } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_GetProperty failed for {}", name())
+                }
+                if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_ValueToObject failed for {}", name())
+                }
+            }
+
+            if let Some(interface) = func.interface() {
+                rooted!(&in(cx) let mut value = UndefinedValue());
+                if !unsafe {
+                    JS_GetProperty(
+                        cx,
+                        object.handle(),
                         CString::new(interface.replace([':', '/', '-'], "_"))
                             .unwrap()
                             .as_bytes_with_nul()
@@ -258,8 +387,6 @@ impl MyInterpreter {
                     unsafe { PrintAndClearException(cx.raw_cx()) }
                     panic!("JS_ValueToObject failed for {}", name())
                 }
-            } else {
-                object.set(global_object.get());
             }
 
             rooted!(&in(cx) let mut function = UndefinedValue());
@@ -334,10 +461,8 @@ impl Interpreter for MyInterpreter {
     }
 
     fn resource_dtor(ty: wit::Resource, handle: usize) {
-        // We don't currently include a `drop` function as part of the abstract
-        // base class we generate for an exported resource, so there's nothing
-        // to do here.  If/when that changes, we'll want to call `drop` here.
         _ = (ty, handle);
+        todo!()
     }
 }
 

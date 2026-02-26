@@ -76,6 +76,20 @@ async fn simple_export() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn simple_import_and_export() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        42 + 3 + 2,
+        instance
+            .componentize_js_tests_simple_import_and_export()
+            .call_foo(&mut store, 42)
+            .await?
+    );
+    Ok(())
+}
+
 impl componentize_js::tests::simple_import_and_export::Host for Ctx {
     async fn foo(&mut self, v: u32) -> anyhow::Result<u32> {
         Ok(v + 2)
