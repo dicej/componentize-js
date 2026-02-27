@@ -607,35 +607,40 @@ impl Interpreter for MyInterpreter {
                 STATUS_RETURNED => {
                     waitable_join(event1, 0);
                     subtask_drop(event1);
+
+                    let Promise::ImportCall {
+                        index,
+                        buffer,
+                        call,
+                        ..
+                    } = state.pending.get_mut(event1).unwrap()
+                    else {
+                        unreachable!()
+                    };
+
+                    let func = WIT
+                        .get()
+                        .unwrap()
+                        .import_func(usize::try_from(index).unwrap());
+
+                    unsafe { func.lift_import_async_result(call, buffer) };
+                    assert!(call.stack.len() < 2);
+
                     with_context(|cx| {
-                        let Promise::ImportCall {
-                            index,
-                            buffer,
-                            call,
-                            resolve,
-                            ..
-                        } = state.pending.remove(event1).unwrap()
+                        let Promise::ImportCall { call, resolve, .. } =
+                            state.pending.remove(event1).unwrap()
                         else {
                             unreachable!()
                         };
 
                         rooted!(&in(cx) let resolve = resolve.get());
-
-                        let func = WIT
-                            .get()
-                            .unwrap()
-                            .import_func(usize::try_from(index).unwrap());
-
-                        unsafe { func.lift_import_async_result(call, buffer) };
-                        assert!(call.stack.len() < 2);
-
                         rooted!(&in(cx) let result = UndefinedValue());
                         if func.result.is_some() {
                             result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
                         }
                         rooted!(&in(cx) let params = vec![result.get()]);
                         rooted!(&in(cx) let object = UndefinedValue());
-                        rooted!(&in(cx) let result = UndefinedValue());
+                        rooted!(&in(cx) let mut result = UndefinedValue());
                         if !unsafe {
                             JS_CallFunctionValue(
                                 cx,
@@ -650,6 +655,7 @@ impl Interpreter for MyInterpreter {
                         }
                     });
                 }
+                _ => todo!(),
             },
             _ => todo!(),
         }
