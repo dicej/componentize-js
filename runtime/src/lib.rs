@@ -8,6 +8,7 @@ use {
     anyhow::{Context as _, anyhow, bail},
     mozjs::{
         context::JSContext,
+        gc::Handle,
         glue::{
             CallObjectTracer, CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
             JSPrincipalsCallbacks, PrintAndClearException,
@@ -25,13 +26,13 @@ use {
             wrappers2::{
                 CurrentGlobalOrNull, Evaluate, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
                 JS_GetElement, JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewFunction,
-                JS_NewGlobalObject, JS_SetProperty, JS_ValueToObject,
+                JS_NewGlobalObject, JS_SetProperty, JS_ValueToObject, RunJobs,
             },
         },
     },
     std::{
         alloc::{self, Layout},
-        collections::{BTreeMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         ffi::{CString, c_char, c_void},
         hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
         marker::PhantomData,
@@ -58,10 +59,60 @@ mod bindings {
     export!(MyExports);
 }
 
-static WIT: OnceLock<Wit> = OnceLock::new();
+#[link(wasm_import_module = "$root")]
+unsafe extern "C" {
+    #[link_name = "[subtask-drop]"]
+    pub fn subtask_drop(task: u32);
+}
+#[link(wasm_import_module = "$root")]
+unsafe extern "C" {
+    #[link_name = "[waitable-join]"]
+    pub fn waitable_join(waitable: u32, set: u32);
+}
+#[link(wasm_import_module = "$root")]
+unsafe extern "C" {
+    #[link_name = "[waitable-set-drop]"]
+    pub fn waitable_set_drop(set: u32);
+}
+#[link(wasm_import_module = "$root")]
+unsafe extern "C" {
+    #[link_name = "[context-get-0]"]
+    pub fn context_get() -> u32;
+}
+#[link(wasm_import_module = "$root")]
+unsafe extern "C" {
+    #[link_name = "[context-set-0]"]
+    pub fn context_set(value: u32);
+}
+
+pub const EVENT_NONE: u32 = 0;
+pub const EVENT_SUBTASK: u32 = 1;
+
+pub const STATUS_STARTING: u32 = 0;
+pub const STATUS_STARTED: u32 = 1;
+pub const STATUS_RETURNED: u32 = 2;
+
+pub const CALLBACK_CODE_EXIT: u32 = 0;
+pub const CALLBACK_CODE_WAIT: u32 = 2;
 
 struct Borrow;
 struct EmptyResource;
+
+enum Pending {
+    ImportCall {
+        index: usize,
+        call: MyCall<'static>,
+        buffer: *mut u8,
+    },
+    #[expect(unused)]
+    StreamRead, // etc.
+}
+
+#[derive(Default)]
+struct TaskState {
+    pending: HashMap<u32, Pending>,
+    waitable_set: Option<u32>,
+}
 
 struct SyncSend<T>(T);
 
@@ -89,9 +140,11 @@ impl<T> Eq for ArcHash<T> {}
 
 type Stacks = HashSet<ArcHash<Mutex<Vec<Box<Heap<Value>>>>>, BuildHasherDefault<DefaultHasher>>;
 
+static WIT: OnceLock<Wit> = OnceLock::new();
 static RUNTIME: Mutex<Option<SyncSend<Runtime>>> = Mutex::new(None);
 static GLOBAL_OBJECT: Mutex<Option<SyncSend<Box<Heap<*mut JSObject>>>>> = Mutex::new(None);
 static STACKS: Mutex<Stacks> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+static CURRENT_TASK_STATE: Mutex<Option<SyncSend<TaskState>>> = Mutex::new(None);
 
 fn make_runtime() -> anyhow::Result<Runtime> {
     let engine = JSEngine::init()
@@ -222,41 +275,49 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
         let resolve = args.index(2);
         let reject = args.index(3);
 
-        if let Some(pending) = func.call_import_async(call) {
-            let state = CURRENT_TASK_STATE.try_lock().unwrap().as_mut().unwrap();
-            state.pending.insert(
-                pending.subtask,
-                Promise::ImportCall {
-                    index,
-                    call,
-                    buffer: pending.buffer,
-                    resolve: Heap::boxed(resolve),
-                    reject: Heap::boxed(reject),
-                },
-            );
+        if let Some(pending) = unsafe { func.call_import_async(&mut call) } {
+            call.stack
+                .try_lock()
+                .unwrap()
+                .extend([Heap::boxed(resolve.get()), Heap::boxed(reject.get())]);
+
+            CURRENT_TASK_STATE
+                .try_lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .0
+                .pending
+                .insert(
+                    pending.subtask,
+                    Pending::ImportCall {
+                        index: usize::try_from(index.to_int32()).unwrap(),
+                        call,
+                        buffer: pending.buffer,
+                    },
+                );
         } else {
-            rooted!(&in(cx) let result = UndefinedValue());
-            if func.result.is_some() {
+            rooted!(&in(cx) let mut result = UndefinedValue());
+            if func.result().is_some() {
                 result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
             }
             rooted!(&in(cx) let params = vec![result.get()]);
-            rooted!(&in(cx) let object = UndefinedValue());
-            rooted!(&in(cx) let result = UndefinedValue());
+            rooted!(&in(cx) let mut result = UndefinedValue());
             if !unsafe {
                 JS_CallFunctionValue(
                     cx,
-                    object.handle(),
-                    resolve.handle(),
+                    Handle::<*mut JSObject>::null(),
+                    Handle::from_raw(resolve),
                     &HandleValueArray::from(&params),
                     result.handle_mut(),
                 )
             } {
                 unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_CallFunctionValue failed for `{}`", name())
+                panic!("JS_CallFunctionValue failed for `resolve`")
             }
         }
 
-        args.rval(UndefinedValue())
+        args.rval().set(UndefinedValue())
     } else {
         assert_eq!(argc, 2);
 
@@ -319,7 +380,7 @@ fn init(script: &str) -> anyhow::Result<()> {
                         let value = if func.is_async() {
                             format!(
                                 "new Promise((a,b)=>\
-                                 componentize_js_call_import({index},[{params}],a,b)"
+                                 componentize_js_call_import({index},[{params}],a,b))"
                             )
                         } else {
                             format!("componentize_js_call_import({index},[{params}])")
@@ -352,7 +413,7 @@ fn init(script: &str) -> anyhow::Result<()> {
             // wrappers for all of them; the wrappers for the sync functions
             // won't actually be used.  Once we move this code to the host side,
             // we'll have that information and can be more precise.
-            imports
+            exports
                 .entry(func.interface())
                 .or_default()
                 .push((index, func));
@@ -362,19 +423,22 @@ fn init(script: &str) -> anyhow::Result<()> {
             .into_iter()
             .map(|(interface, funcs)| {
                 let interface = interface.map(|v| v.replace([':', '/', '-'], "_"));
-                let funcs = exports
+                let funcs = funcs
                     .into_iter()
                     .map(|(index, func)| {
-                        let interface = interface.map(|v| format!("{v}."));
+                        let interface = interface
+                            .as_ref()
+                            .map(|v| format!("{v}."))
+                            .unwrap_or_else(String::new);
                         let name = func.name().replace('-', "_");
                         let params = (0..func.params().len())
-                            .map(|i| format!(",p{i}"))
+                            .map(|i| format!("p{i}"))
                             .collect::<Vec<_>>()
-                            .concat();
+                            .join(",");
                         format!(
                             "{name}:function({params}){{\
                              return exports.{interface}{name}({params})\
-                             .then((a,b)=>componentize_js_resolve({index},a,b)))\
+                             .then((a,b)=>componentize_js_resolve({index},a,b))\
                              }}"
                         )
                     })
@@ -393,7 +457,9 @@ fn init(script: &str) -> anyhow::Result<()> {
         // Finally, append the generated code to the script and execute the
         // result.
         let script = format!(
-            "{script}\nvar imports = {{{imports}}}\nvar componentize_js_async_exports = {{{imports}}}"
+            "{script}\n\
+             var imports = {{{imports}}}\n\
+             var componentize_js_async_exports = {{{exports}}}"
         );
         let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
         let script = script.encode_utf16().collect::<Vec<_>>();
@@ -410,16 +476,16 @@ fn init(script: &str) -> anyhow::Result<()> {
 fn poll(cx: &mut JSContext) -> u32 {
     unsafe { RunJobs(cx) }
 
-    let state = CURRENT_TASK_STATE.try_lock().unwrap().take().unwrap();
+    let mut state = CURRENT_TASK_STATE.try_lock().unwrap().take().unwrap().0;
     if state.pending.is_empty() {
         if let Some(set) = state.waitable_set.take() {
-            waitable_set_drop(set);
+            unsafe { waitable_set_drop(set) }
         }
 
         CALLBACK_CODE_EXIT
     } else {
         let set = state.waitable_set.unwrap();
-        context_set(Box::into_raw(state));
+        unsafe { context_set(u32::try_from(Box::into_raw(Box::new(state)) as usize).unwrap()) }
 
         CALLBACK_CODE_WAIT | (set << 4)
     }
@@ -471,7 +537,7 @@ impl MyInterpreter {
         };
 
         if async_ {
-            *CURRENT_TASK_STATE.try_lock().unwrap() = Some(Box::new(TaskState::new()));
+            *CURRENT_TASK_STATE.try_lock().unwrap() = Some(SyncSend(TaskState::default()));
         }
 
         with_context(|cx| {
@@ -597,7 +663,10 @@ impl Interpreter for MyInterpreter {
     }
 
     fn export_async_callback(event0: u32, event1: u32, event2: u32) -> u32 {
-        let state = unsafe { Box::from_raw(context_get() as *mut TaskState) };
+        *CURRENT_TASK_STATE.try_lock().unwrap() = Some(SyncSend(*unsafe {
+            Box::from_raw(context_get() as *mut TaskState)
+        }));
+        unsafe { context_set(0) }
 
         match event0 {
             EVENT_NONE => {}
@@ -605,53 +674,54 @@ impl Interpreter for MyInterpreter {
                 STATUS_STARTING => unreachable!(),
                 STATUS_STARTED => {}
                 STATUS_RETURNED => {
-                    waitable_join(event1, 0);
-                    subtask_drop(event1);
+                    unsafe {
+                        waitable_join(event1, 0);
+                        subtask_drop(event1);
+                    }
 
-                    let Promise::ImportCall {
+                    let Pending::ImportCall {
                         index,
                         buffer,
-                        call,
-                        ..
-                    } = state.pending.get_mut(event1).unwrap()
+                        mut call,
+                    } = CURRENT_TASK_STATE
+                        .try_lock()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .0
+                        .pending
+                        .remove(&event1)
+                        .unwrap()
                     else {
                         unreachable!()
                     };
 
-                    let func = WIT
-                        .get()
-                        .unwrap()
-                        .import_func(usize::try_from(index).unwrap());
+                    let func = WIT.get().unwrap().import_func(index);
 
-                    unsafe { func.lift_import_async_result(call, buffer) };
-                    assert!(call.stack.len() < 2);
+                    unsafe { func.lift_import_async_result(&mut call, buffer) };
+                    assert!(call.stack.try_lock().unwrap().len() < 2);
 
                     with_context(|cx| {
-                        let Promise::ImportCall { call, resolve, .. } =
-                            state.pending.remove(event1).unwrap()
-                        else {
-                            unreachable!()
-                        };
-
-                        rooted!(&in(cx) let resolve = resolve.get());
-                        rooted!(&in(cx) let result = UndefinedValue());
-                        if func.result.is_some() {
+                        // skip `reject` callback
+                        _ = call.stack.try_lock().unwrap().pop().unwrap();
+                        rooted!(&in(cx) let resolve = call.stack.try_lock().unwrap().pop().unwrap().get());
+                        rooted!(&in(cx) let mut result = UndefinedValue());
+                        if func.result().is_some() {
                             result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
                         }
                         rooted!(&in(cx) let params = vec![result.get()]);
-                        rooted!(&in(cx) let object = UndefinedValue());
                         rooted!(&in(cx) let mut result = UndefinedValue());
                         if !unsafe {
                             JS_CallFunctionValue(
                                 cx,
-                                object.handle(),
+                                Handle::<*mut JSObject>::null(),
                                 resolve.handle(),
                                 &HandleValueArray::from(&params),
                                 result.handle_mut(),
                             )
                         } {
                             unsafe { PrintAndClearException(cx.raw_cx()) }
-                            panic!("JS_CallFunctionValue failed for `{}`", name())
+                            panic!("JS_CallFunctionValue failed for `resolve`")
                         }
                     });
                 }

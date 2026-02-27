@@ -14,7 +14,7 @@ use {
     zstd::Encoder,
 };
 
-const DEBUG_RUNTIME: bool = false;
+const DEBUG_RUNTIME: bool = true;
 const STRIP_RUNTIME: bool = !DEBUG_RUNTIME;
 const ZSTD_COMPRESSION_LEVEL: i32 = if DEBUG_RUNTIME { 0 } else { 19 };
 

@@ -1,6 +1,6 @@
 use {
     super::Ctx,
-    std::{sync::LazyLock, time::Duration},
+    std::sync::LazyLock,
     tokio::sync::OnceCell,
     wasmtime::{
         Config, Engine, Store,
@@ -15,8 +15,6 @@ wasmtime::component::bindgen!({
     imports: { default: async | trappable },
     exports: { default: async | task_exit },
 });
-
-const DELAY: Duration = Duration::from_millis(100);
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = Config::new();
