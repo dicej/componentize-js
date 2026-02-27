@@ -1215,7 +1215,6 @@ dependencies = [
 [[package]]
 name = "mozjs"
 version = "0.15.0"
-source = "git+https://github.com/dicej/mozjs?rev=0dfa831a#0dfa831a9cfa6699b9fd2e5836e3ac01de565def"
 dependencies = [
  "bindgen",
  "cc",
@@ -1229,7 +1228,6 @@ dependencies = [
 [[package]]
 name = "mozjs_sys"
 version = "0.140.5-10"
-source = "git+https://github.com/dicej/mozjs?rev=0dfa831a#0dfa831a9cfa6699b9fd2e5836e3ac01de565def"
 dependencies = [
  "bindgen",
  "cc",

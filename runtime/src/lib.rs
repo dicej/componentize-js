@@ -114,6 +114,8 @@ struct TaskState {
     waitable_set: Option<u32>,
 }
 
+type JsFunction = unsafe extern "C" fn(*mut RawJSContext, u32, *mut Value) -> bool;
+
 struct SyncSend<T>(T);
 
 unsafe impl<T> Sync for SyncSend<T> {}
@@ -229,7 +231,6 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     assert!(argc >= 2);
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
-
     let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
     let index = args.index(0);
     let params = args.index(1);
@@ -331,24 +332,54 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     true
 }
 
+unsafe extern "C" fn resolve(_: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 2);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let index = args.index(0);
+    let value = args.index(1);
+
+    let func = WIT
+        .get()
+        .unwrap()
+        .export_func(usize::try_from(index.to_int32()).unwrap());
+
+    let mut call = MyCall::new();
+    if func.result().is_some() {
+        call.stack
+            .try_lock()
+            .unwrap()
+            .push(Heap::boxed(value.get()));
+    }
+    func.call_task_return(&mut call);
+
+    args.rval().set(UndefinedValue());
+    true
+}
+
 fn init(script: &str) -> anyhow::Result<()> {
     with_context(|cx| {
-        // First, add `call_import` to the global object.
-        let call_import = unsafe { JS_NewFunction(cx, Some(call_import), 2, 0, ptr::null()) };
-        rooted!(&in(cx) let mut call_import = ObjectValue(unsafe {
-            JS_GetFunctionObject(call_import)
-        }));
-        rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-        if !unsafe {
-            JS_SetProperty(
-                cx,
-                global_object.handle(),
-                c"componentize_js_call_import".as_ptr() as *const c_char,
-                call_import.handle(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            bail!("JS_SetProperty failed")
+        // First, add some Rust-defined functions to the global object.
+        for (name, func) in [
+            (c"componentize_js_call_import", call_import as JsFunction),
+            (c"componentize_js_resolve", resolve as JsFunction),
+        ] {
+            let func = unsafe { JS_NewFunction(cx, Some(func), 2, 0, ptr::null()) };
+            rooted!(&in(cx) let mut func = ObjectValue(unsafe {
+                JS_GetFunctionObject(func)
+            }));
+            rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+            if !unsafe {
+                JS_SetProperty(
+                    cx,
+                    global_object.handle(),
+                    name.as_ptr() as *const c_char,
+                    func.handle(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                bail!("JS_SetProperty failed")
+            }
         }
 
         // Next, generate JS code which will add an `imports` property to the
@@ -438,7 +469,7 @@ fn init(script: &str) -> anyhow::Result<()> {
                         format!(
                             "{name}:function({params}){{\
                              return exports.{interface}{name}({params})\
-                             .then((a,b)=>componentize_js_resolve({index},a,b))\
+                             .then((v)=>componentize_js_resolve({index},v))\
                              }}"
                         )
                     })
