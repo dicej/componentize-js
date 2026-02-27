@@ -597,8 +597,64 @@ impl Interpreter for MyInterpreter {
     }
 
     fn export_async_callback(event0: u32, event1: u32, event2: u32) -> u32 {
-        _ = (event0, event1, event2);
-        todo!()
+        let state = unsafe { Box::from_raw(context_get() as *mut TaskState) };
+
+        match event0 {
+            EVENT_NONE => {}
+            EVENT_SUBTASK => match event2 {
+                STATUS_STARTING => unreachable!(),
+                STATUS_STARTED => {}
+                STATUS_RETURNED => {
+                    waitable_join(event1, 0);
+                    subtask_drop(event1);
+                    with_context(|cx| {
+                        let Promise::ImportCall {
+                            index,
+                            buffer,
+                            call,
+                            resolve,
+                            ..
+                        } = state.pending.remove(event1).unwrap()
+                        else {
+                            unreachable!()
+                        };
+
+                        rooted!(&in(cx) let resolve = resolve.get());
+
+                        let func = WIT
+                            .get()
+                            .unwrap()
+                            .import_func(usize::try_from(index).unwrap());
+
+                        unsafe { func.lift_import_async_result(call, buffer) };
+                        assert!(call.stack.len() < 2);
+
+                        rooted!(&in(cx) let result = UndefinedValue());
+                        if func.result.is_some() {
+                            result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
+                        }
+                        rooted!(&in(cx) let params = vec![result.get()]);
+                        rooted!(&in(cx) let object = UndefinedValue());
+                        rooted!(&in(cx) let result = UndefinedValue());
+                        if !unsafe {
+                            JS_CallFunctionValue(
+                                cx,
+                                object.handle(),
+                                resolve.handle(),
+                                &HandleValueArray::from(&params),
+                                result.handle_mut(),
+                            )
+                        } {
+                            unsafe { PrintAndClearException(cx.raw_cx()) }
+                            panic!("JS_CallFunctionValue failed for `{}`", name())
+                        }
+                    });
+                }
+            },
+            _ => todo!(),
+        }
+
+        with_context(poll)
     }
 
     fn resource_dtor(ty: wit::Resource, handle: usize) {
