@@ -8,28 +8,32 @@ use {
     anyhow::{Context as _, anyhow, bail},
     mozjs::{
         context::JSContext,
-        conversions::jsstr_to_string,
+        conversions::{Utf8Chars, jsstr_to_string},
         gc::Handle,
         glue::{
-            CallObjectTracer, CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
+            CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
             JSPrincipalsCallbacks, PrintAndClearException,
         },
         jsapi::{
             GCTraceKindToAscii, HandleValueArray, Heap, JS_CallArgsFromVp, JS_GetFunctionObject,
-            JS_HoldPrincipals, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps,
-            JSContext as RawJSContext, JSObject, JSTracer, OnNewGlobalHookOption, TraceKind, Value,
+            JS_HoldPrincipals, JSAutoRealm, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps,
+            JSContext as RawJSContext, JSObject, JSTracer, OnNewGlobalHookOption, Value,
         },
-        jsval::{ObjectValue, UInt32Value, UndefinedValue},
-        realm::AutoRealm,
+        jsval::{
+            BigIntValue, BooleanValue, DoubleValue, Int32Value, ObjectValue, StringValue,
+            UInt32Value, UndefinedValue,
+        },
         rooted,
         rust::{
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
             wrappers2::{
-                CurrentGlobalOrNull, Evaluate, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
-                JS_GetElement, JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewFunction,
-                JS_NewGlobalObject, JS_SetProperty, JS_ValueToObject, RunJobs,
+                BigIntFromInt64, BigIntFromUint64, BigIntToString, CurrentGlobalOrNull, Evaluate,
+                JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_GetElement, JS_GetProperty,
+                JS_InitDestroyPrincipalsCallback, JS_NewFunction, JS_NewGlobalObject,
+                JS_NewStringCopyUTF8N, JS_SetProperty, JS_ValueToObject, NewArrayObject1, RunJobs,
             },
         },
+        typedarray::{ArrayBuffer, CreateWith},
     },
     std::{
         alloc::{self, Layout},
@@ -40,10 +44,11 @@ use {
         mem,
         ops::DerefMut,
         ptr::{self, NonNull},
+        slice,
         sync::{Arc, Mutex, OnceLock},
     },
     wit_dylib_ffi::{
-        self as wit, Call, ExportFunction, Interpreter, List, Wit, WitOption, WitResult,
+        self as wit, Call, ExportFunction, Interpreter, List, Type, Wit, WitOption, WitResult,
     },
 };
 
@@ -122,6 +127,7 @@ struct TaskState {
 
 type JsFunction = unsafe extern "C" fn(*mut RawJSContext, u32, *mut Value) -> bool;
 
+#[derive(Copy, Clone)]
 struct SyncSend<T>(T);
 
 unsafe impl<T> Sync for SyncSend<T> {}
@@ -149,12 +155,11 @@ impl<T> Eq for ArcHash<T> {}
 type Stacks = HashSet<ArcHash<Mutex<Vec<Box<Heap<Value>>>>>, BuildHasherDefault<DefaultHasher>>;
 
 static WIT: OnceLock<Wit> = OnceLock::new();
-static RUNTIME: Mutex<Option<SyncSend<Runtime>>> = Mutex::new(None);
-static GLOBAL_OBJECT: Mutex<Option<SyncSend<Box<Heap<*mut JSObject>>>>> = Mutex::new(None);
+static CONTEXT: OnceLock<SyncSend<NonNull<RawJSContext>>> = OnceLock::new();
 static STACKS: Mutex<Stacks> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
 static CURRENT_TASK_STATE: Mutex<Option<SyncSend<TaskState>>> = Mutex::new(None);
 
-fn make_runtime() -> anyhow::Result<Runtime> {
+fn init_runtime() -> anyhow::Result<()> {
     let engine = JSEngine::init()
         .map_err(|e| anyhow!("{e:?}"))
         .context("JSEngine::init failed")?;
@@ -206,7 +211,7 @@ fn make_runtime() -> anyhow::Result<Runtime> {
         oOps: ptr::null(),
     }));
 
-    *GLOBAL_OBJECT.try_lock().unwrap() = Some(SyncSend(Heap::boxed(unsafe {
+    let global_object = unsafe {
         JS_NewGlobalObject(
             cx,
             global_class,
@@ -214,23 +219,26 @@ fn make_runtime() -> anyhow::Result<Runtime> {
             OnNewGlobalHookOption::DontFireOnNewGlobalHook,
             &*realm_options,
         )
-    })));
+    };
 
-    Ok(runtime)
+    let cx = runtime.cx();
+    mem::forget(JSAutoRealm::new(
+        unsafe { cx.raw_cx_no_gc() },
+        global_object,
+    ));
+
+    CONTEXT
+        .set(SyncSend(NonNull::new(unsafe { cx.raw_cx() }).unwrap()))
+        .map_err(drop)
+        .unwrap();
+
+    mem::forget(runtime);
+
+    Ok(())
 }
 
-fn with_context<T: 'static>(fun: impl FnOnce(&mut JSContext) -> T) -> T {
-    let mut runtime = RUNTIME.lock().unwrap();
-    if runtime.is_none() {
-        *runtime = Some(SyncSend(make_runtime().unwrap()));
-    }
-
-    let runtime = &mut runtime.as_mut().unwrap().0;
-    let mut realm = AutoRealm::new(
-        runtime.cx(),
-        NonNull::new(GLOBAL_OBJECT.try_lock().unwrap().as_ref().unwrap().0.get()).unwrap(),
-    );
-    fun(&mut realm)
+fn context() -> JSContext {
+    unsafe { JSContext::from_ptr(CONTEXT.get().unwrap().0) }
 }
 
 unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
@@ -268,12 +276,9 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
         rooted!(&in(cx) let mut value = UndefinedValue());
         if !unsafe { JS_GetElement(cx, params.handle(), index, value.handle_mut()) } {
             unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `{index}`")
+            panic!("JS_GetElement failed for `{index}`")
         }
-        call.stack
-            .try_lock()
-            .unwrap()
-            .push(Heap::boxed(value.get()));
+        call.push(value.get());
     }
 
     if func.is_async() {
@@ -308,7 +313,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
         } else {
             rooted!(&in(cx) let mut result = UndefinedValue());
             if func.result().is_some() {
-                result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
+                result.set(call.pop());
             }
             rooted!(&in(cx) let params = vec![result.get()]);
             rooted!(&in(cx) let mut result = UndefinedValue());
@@ -331,9 +336,9 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
         assert_eq!(argc, 2);
 
         func.call_import_sync(&mut call);
+
         if func.result().is_some() {
-            args.rval()
-                .set(call.stack.try_lock().unwrap().pop().unwrap().get());
+            args.rval().set(call.pop());
         }
     }
 
@@ -354,11 +359,9 @@ unsafe extern "C" fn call_task_return(_: *mut RawJSContext, argc: u32, vp: *mut 
 
     let mut call = MyCall::new();
     if func.result().is_some() {
-        call.stack
-            .try_lock()
-            .unwrap()
-            .push(Heap::boxed(value.get()));
+        call.push(value.get());
     }
+
     func.call_task_return(&mut call);
 
     args.rval().set(UndefinedValue());
@@ -375,162 +378,164 @@ unsafe extern "C" fn log(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bo
 }
 
 fn init(script: &str) -> anyhow::Result<()> {
-    with_context(|cx| {
-        // First, add some Rust-defined functions to the global object.
-        for (name, func) in [
-            (c"componentize_js_call_import", call_import as JsFunction),
-            (
-                c"componentize_js_call_task_return",
-                call_task_return as JsFunction,
-            ),
-            (c"componentize_js_log", log as JsFunction),
-        ] {
-            let func = unsafe { JS_NewFunction(cx, Some(func), 2, 0, ptr::null()) };
-            rooted!(&in(cx) let mut func = ObjectValue(unsafe {
-                JS_GetFunctionObject(func)
-            }));
-            rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-            if !unsafe {
-                JS_SetProperty(
-                    cx,
-                    global_object.handle(),
-                    name.as_ptr() as *const c_char,
-                    func.handle(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                bail!("JS_SetProperty failed")
-            }
+    init_runtime()?;
+
+    let cx = &mut context();
+
+    // First, add some Rust-defined functions to the global object.
+    for (name, func) in [
+        (c"componentize_js_call_import", call_import as JsFunction),
+        (
+            c"componentize_js_call_task_return",
+            call_task_return as JsFunction,
+        ),
+        (c"componentize_js_log", log as JsFunction),
+    ] {
+        let func = unsafe { JS_NewFunction(cx, Some(func), 2, 0, ptr::null()) };
+        rooted!(&in(cx) let mut func = ObjectValue(unsafe {
+            JS_GetFunctionObject(func)
+        }));
+        rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+        if !unsafe {
+            JS_SetProperty(
+                cx,
+                global_object.handle(),
+                name.as_ptr() as *const c_char,
+                func.handle(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            bail!("JS_SetProperty failed")
         }
+    }
 
-        // Next, generate JS code which will add an `imports` property to the
-        // global object containing any and all imported functions, each of
-        // which will forward their parameters to `call_import`.
-        //
-        // TODO: Move this code to the host side of `componentize-js` and
-        // thereby avoid creating a lot of temporary guest allocations that get
-        // baked into the pre-init snapshot but never used at runtime.
-        let mut imports = BTreeMap::<_, Vec<_>>::new();
-        for (index, func) in WIT.get().unwrap().iter_import_funcs().enumerate() {
-            imports
-                .entry(func.interface())
-                .or_default()
-                .push((index, func));
-        }
+    // Next, generate JS code which will add an `imports` property to the
+    // global object containing any and all imported functions, each of
+    // which will forward their parameters to `call_import`.
+    //
+    // TODO: Move this code to the host side of `componentize-js` and
+    // thereby avoid creating a lot of temporary guest allocations that get
+    // baked into the pre-init snapshot but never used at runtime.
+    let mut imports = BTreeMap::<_, Vec<_>>::new();
+    for (index, func) in WIT.get().unwrap().iter_import_funcs().enumerate() {
+        imports
+            .entry(func.interface())
+            .or_default()
+            .push((index, func));
+    }
 
-        let imports = imports
-            .into_iter()
-            .map(|(interface, funcs)| {
-                let funcs = funcs
-                    .into_iter()
-                    .map(|(index, func)| {
-                        let name = func.name().replace('-', "_");
-                        let params = (0..func.params().len())
-                            .map(|i| format!("p{i}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let value = if func.is_async() {
-                            format!(
-                                "new Promise((a,b)=>\
-                                 componentize_js_call_import({index},[{params}],a,b))"
-                            )
-                        } else {
-                            format!("componentize_js_call_import({index},[{params}])")
-                        };
-                        format!("{name}:function({params}){{return {value}}}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                if let Some(interface) = interface {
-                    let name = interface.replace([':', '/', '-'], "_");
-                    format!("{name}:{{{funcs}}}")
-                } else {
-                    funcs
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // Next, generate JS code which will add a
-        // `componentize_js_async_exports` property to the global object which
-        // will wrap any and all async exports defined in the script so that
-        // they call back into Rust when the promises resolve.
-        //
-        // TODO: As above, move this code to the host side of `componentize-js`.
-        let mut exports = BTreeMap::<_, Vec<_>>::new();
-        for (index, func) in WIT.get().unwrap().iter_export_funcs().enumerate() {
-            // TODO: As of this writing `wit-dylib`, won't tell us which
-            // functions are async, so here we conservatively generate async
-            // wrappers for all of them; the wrappers for the sync functions
-            // won't actually be used.  Once we move this code to the host side,
-            // we'll have that information and can be more precise.
-            exports
-                .entry(func.interface())
-                .or_default()
-                .push((index, func));
-        }
-
-        // For some reason I have not yet determined, we need an `await` to
-        // appear somewhere in the script to force `Promise` to be in scope.
-        //
-        // TODO: Figure out the right way to add `Promise` to the global scope without
-        // this hack:
-        let promise_hack =
-            "var componentize_js_promise_hack = (async function(){await Promise.resolve(42)})()";
-
-        let exports = exports
-            .into_iter()
-            .map(|(interface, funcs)| {
-                let interface = interface.map(|v| v.replace([':', '/', '-'], "_"));
-                let funcs = funcs
-                    .into_iter()
-                    .map(|(index, func)| {
-                        let interface = interface
-                            .as_ref()
-                            .map(|v| format!("{v}."))
-                            .unwrap_or_else(String::new);
-                        let name = func.name().replace('-', "_");
-                        let params = (0..func.params().len())
-                            .map(|i| format!("p{i}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
+    let imports = imports
+        .into_iter()
+        .map(|(interface, funcs)| {
+            let funcs = funcs
+                .into_iter()
+                .map(|(index, func)| {
+                    let name = func.name().replace('-', "_");
+                    let params = (0..func.params().len())
+                        .map(|i| format!("p{i}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let value = if func.is_async() {
                         format!(
-                            "{name}:function({params}){{\n\
+                            "new Promise((a,b)=>\
+                                 componentize_js_call_import({index},[{params}],a,b))"
+                        )
+                    } else {
+                        format!("componentize_js_call_import({index},[{params}])")
+                    };
+                    format!("{name}:function({params}){{return {value}}}")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            if let Some(interface) = interface {
+                let name = interface.replace([':', '/', '-'], "_");
+                format!("{name}:{{{funcs}}}")
+            } else {
+                funcs
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Next, generate JS code which will add a
+    // `componentize_js_async_exports` property to the global object which
+    // will wrap any and all async exports defined in the script so that
+    // they call back into Rust when the promises resolve.
+    //
+    // TODO: As above, move this code to the host side of `componentize-js`.
+    let mut exports = BTreeMap::<_, Vec<_>>::new();
+    for (index, func) in WIT.get().unwrap().iter_export_funcs().enumerate() {
+        // TODO: As of this writing `wit-dylib`, won't tell us which
+        // functions are async, so here we conservatively generate async
+        // wrappers for all of them; the wrappers for the sync functions
+        // won't actually be used.  Once we move this code to the host side,
+        // we'll have that information and can be more precise.
+        exports
+            .entry(func.interface())
+            .or_default()
+            .push((index, func));
+    }
+
+    // For some reason I have not yet determined, we need an `await` to
+    // appear somewhere in the script to force `Promise` to be in scope.
+    //
+    // TODO: Figure out the right way to add `Promise` to the global scope without
+    // this hack:
+    let promise_hack =
+        "var componentize_js_promise_hack = (async function(){await Promise.resolve(42)})()";
+
+    let exports = exports
+        .into_iter()
+        .map(|(interface, funcs)| {
+            let interface = interface.map(|v| v.replace([':', '/', '-'], "_"));
+            let funcs = funcs
+                .into_iter()
+                .map(|(index, func)| {
+                    let interface = interface
+                        .as_ref()
+                        .map(|v| format!("{v}."))
+                        .unwrap_or_else(String::new);
+                    let name = func.name().replace('-', "_");
+                    let params = (0..func.params().len())
+                        .map(|i| format!("p{i}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "{name}:function({params}){{\n\
                              return exports.{interface}{name}({params})\n\
                              .then((v)=>componentize_js_call_task_return({index},v))}}"
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
 
-                if let Some(interface) = interface {
-                    format!("{interface}:{{{funcs}}}")
-                } else {
-                    funcs
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+            if let Some(interface) = interface {
+                format!("{interface}:{{{funcs}}}")
+            } else {
+                funcs
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
 
-        // Finally, append the generated code to the script and execute the
-        // result.
-        let script = format!(
-            "{script}\n\
+    // Finally, append the generated code to the script and execute the
+    // result.
+    let script = format!(
+        "{script}\n\
              var imports = {{{imports}}}\n\
              var componentize_js_async_exports = {{{exports}}}\n\
              {promise_hack}"
-        );
-        let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
-        let script = script.encode_utf16().collect::<Vec<_>>();
-        let mut script = rust::transform_u16_to_source_text(&script);
-        rooted!(&in(cx) let mut result = UndefinedValue());
-        if !unsafe { Evaluate(cx, compile_options.ptr, &mut script, result.handle_mut()) } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            bail!("Evaluate failed")
-        }
-        Ok(())
-    })
+    );
+    let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
+    let script = script.encode_utf16().collect::<Vec<_>>();
+    let mut script = rust::transform_u16_to_source_text(&script);
+    rooted!(&in(cx) let mut result = UndefinedValue());
+    if !unsafe { Evaluate(cx, compile_options.ptr, &mut script, result.handle_mut()) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        bail!("Evaluate failed")
+    }
+    Ok(())
 }
 
 fn poll(cx: &mut JSContext) -> u32 {
@@ -600,104 +605,100 @@ impl MyInterpreter {
             *CURRENT_TASK_STATE.try_lock().unwrap() = Some(SyncSend(TaskState::default()));
         }
 
-        with_context(|cx| {
-            rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-            rooted!(&in(cx) let mut object = ptr::null_mut::<JSObject>());
+        let cx = &mut context();
+        rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+        rooted!(&in(cx) let mut object = ptr::null_mut::<JSObject>());
 
-            {
-                rooted!(&in(cx) let mut value = UndefinedValue());
-                if !unsafe {
-                    JS_GetProperty(
-                        cx,
-                        global_object.handle(),
-                        if async_ {
-                            c"componentize_js_async_exports"
-                        } else {
-                            c"exports"
-                        }
-                        .as_ptr() as *const c_char,
-                        value.handle_mut(),
-                    )
-                } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_GetProperty failed for `{}`", name())
-                }
-                if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_ValueToObject failed for `{}`", name())
-                }
-            }
-
-            if let Some(interface) = func.interface() {
-                rooted!(&in(cx) let mut value = UndefinedValue());
-                if !unsafe {
-                    JS_GetProperty(
-                        cx,
-                        object.handle(),
-                        CString::new(interface.replace([':', '/', '-'], "_"))
-                            .unwrap()
-                            .as_bytes_with_nul()
-                            .as_ptr() as *const c_char,
-                        value.handle_mut(),
-                    )
-                } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_GetProperty failed for `{}`", name())
-                }
-                if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_ValueToObject failed for `{}`", name())
-                }
-            }
-
-            rooted!(&in(cx) let mut function = UndefinedValue());
+        {
+            rooted!(&in(cx) let mut value = UndefinedValue());
             if !unsafe {
                 JS_GetProperty(
                     cx,
-                    object.handle(),
-                    CString::new(func.name())
-                        .unwrap()
-                        .as_bytes_with_nul()
-                        .as_ptr() as *const c_char,
-                    function.handle_mut(),
+                    global_object.handle(),
+                    if async_ {
+                        c"componentize_js_async_exports"
+                    } else {
+                        c"exports"
+                    }
+                    .as_ptr() as *const c_char,
+                    value.handle_mut(),
                 )
             } {
                 unsafe { PrintAndClearException(cx.raw_cx()) }
                 panic!("JS_GetProperty failed for `{}`", name())
             }
+            if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_ValueToObject failed for `{}`", name())
+            }
+        }
 
-            let params = mem::take(call.stack.try_lock().unwrap().deref_mut())
-                .into_iter()
-                .map(|v| v.get())
-                .collect::<Vec<_>>();
-            rooted!(&in(cx) let params = params);
-            rooted!(&in(cx) let mut result = UndefinedValue());
+        if let Some(interface) = func.interface() {
+            rooted!(&in(cx) let mut value = UndefinedValue());
             if !unsafe {
-                JS_CallFunctionValue(
+                JS_GetProperty(
                     cx,
                     object.handle(),
-                    function.handle(),
-                    &HandleValueArray::from(&params),
-                    result.handle_mut(),
+                    CString::new(interface.replace([':', '/', '-'], "_"))
+                        .unwrap()
+                        .as_bytes_with_nul()
+                        .as_ptr() as *const c_char,
+                    value.handle_mut(),
                 )
             } {
                 unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_CallFunctionValue failed for `{}`", name())
+                panic!("JS_GetProperty failed for `{}`", name())
+            }
+            if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_ValueToObject failed for `{}`", name())
+            }
+        }
+
+        rooted!(&in(cx) let mut function = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                object.handle(),
+                CString::new(func.name().replace('-', "_"))
+                    .unwrap()
+                    .as_bytes_with_nul()
+                    .as_ptr() as *const c_char,
+                function.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `{}`", name())
+        }
+
+        let params = mem::take(call.stack.try_lock().unwrap().deref_mut())
+            .into_iter()
+            .map(|v| v.get())
+            .collect::<Vec<_>>();
+        rooted!(&in(cx) let params = params);
+        rooted!(&in(cx) let mut result = UndefinedValue());
+        if !unsafe {
+            JS_CallFunctionValue(
+                cx,
+                object.handle(),
+                function.handle(),
+                &HandleValueArray::from(&params),
+                result.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_CallFunctionValue failed for `{}`", name())
+        }
+
+        if async_ {
+            poll(cx)
+        } else {
+            if func.result().is_some() {
+                call.push(result.get());
             }
 
-            if async_ {
-                poll(cx)
-            } else {
-                if func.result().is_some() {
-                    call.stack
-                        .try_lock()
-                        .unwrap()
-                        .push(Heap::boxed(result.get()));
-                }
-
-                0
-            }
-        })
+            0
+        }
     }
 }
 
@@ -725,6 +726,8 @@ impl Interpreter for MyInterpreter {
             Box::from_raw(context_get() as *mut TaskState)
         }));
         unsafe { context_set(0) }
+
+        let cx = &mut context();
 
         match event0 {
             EVENT_NONE => {}
@@ -759,35 +762,33 @@ impl Interpreter for MyInterpreter {
                     unsafe { func.lift_import_async_result(&mut call, buffer) };
                     assert!(call.stack.try_lock().unwrap().len() < 4);
 
-                    with_context(|cx| {
-                        rooted!(&in(cx) let mut result = UndefinedValue());
-                        if func.result().is_some() {
-                            result.set(call.stack.try_lock().unwrap().pop().unwrap().get());
-                        }
-                        _ = call.stack.try_lock().unwrap().pop().unwrap(); // skip `reject` callback
-                        rooted!(&in(cx) let resolve = call.stack.try_lock().unwrap().pop().unwrap().get());
-                        rooted!(&in(cx) let params = vec![result.get()]);
-                        rooted!(&in(cx) let mut result = UndefinedValue());
-                        if !unsafe {
-                            JS_CallFunctionValue(
-                                cx,
-                                Handle::<*mut JSObject>::null(),
-                                resolve.handle(),
-                                &HandleValueArray::from(&params),
-                                result.handle_mut(),
-                            )
-                        } {
-                            unsafe { PrintAndClearException(cx.raw_cx()) }
-                            panic!("JS_CallFunctionValue failed for `resolve`")
-                        }
-                    });
+                    rooted!(&in(cx) let mut result = UndefinedValue());
+                    if func.result().is_some() {
+                        result.set(call.pop());
+                    }
+                    _ = call.pop(); // skip `reject` callback
+                    rooted!(&in(cx) let resolve = call.pop());
+                    rooted!(&in(cx) let params = vec![result.get()]);
+                    rooted!(&in(cx) let mut result = UndefinedValue());
+                    if !unsafe {
+                        JS_CallFunctionValue(
+                            cx,
+                            Handle::<*mut JSObject>::null(),
+                            resolve.handle(),
+                            &HandleValueArray::from(&params),
+                            result.handle_mut(),
+                        )
+                    } {
+                        unsafe { PrintAndClearException(cx.raw_cx()) }
+                        panic!("JS_CallFunctionValue failed for `resolve`")
+                    }
                 }
                 _ => todo!(),
             },
             _ => todo!(),
         }
 
-        with_context(poll)
+        poll(cx)
     }
 
     fn resource_dtor(ty: wit::Resource, handle: usize) {
@@ -821,6 +822,18 @@ impl MyCall<'_> {
             resources: None,
         }
     }
+
+    fn push(&mut self, value: Value) {
+        self.stack.try_lock().unwrap().push(Heap::boxed(value));
+    }
+
+    fn pop(&mut self) -> Value {
+        self.stack.try_lock().unwrap().pop().unwrap().get()
+    }
+
+    fn last(&mut self) -> Value {
+        self.stack.try_lock().unwrap().last().unwrap().get()
+    }
 }
 
 impl Drop for MyCall<'_> {
@@ -846,61 +859,88 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_u8(&mut self) -> u8 {
-        todo!()
+        (self.pop().to_int32() as u32).try_into().unwrap()
     }
 
     fn pop_u16(&mut self) -> u16 {
-        todo!()
+        (self.pop().to_int32() as u32).try_into().unwrap()
     }
 
     fn pop_u32(&mut self) -> u32 {
-        self.stack
-            .try_lock()
-            .unwrap()
-            .pop()
-            .unwrap()
-            .get()
-            .to_int32() as u32
+        self.pop().to_number() as u32
     }
 
     fn pop_u64(&mut self) -> u64 {
-        todo!()
+        let value = self.pop();
+        if value.is_int32() {
+            value.to_int32() as u64
+        } else {
+            // TODO: is there a more efficient way to do this?
+            let cx = &mut context();
+            rooted!(&in(cx) let value = value.to_bigint());
+            rooted!(&in(cx) let value = unsafe { BigIntToString(cx, value.handle(), 10) });
+            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(value.get()).unwrap()) }
+                .parse()
+                .unwrap()
+        }
     }
 
     fn pop_s8(&mut self) -> i8 {
-        todo!()
+        self.pop().to_int32().try_into().unwrap()
     }
 
     fn pop_s16(&mut self) -> i16 {
-        todo!()
+        self.pop().to_int32().try_into().unwrap()
     }
 
     fn pop_s32(&mut self) -> i32 {
-        todo!()
+        self.pop().to_int32()
     }
 
     fn pop_s64(&mut self) -> i64 {
-        todo!()
+        let value = self.pop();
+        if value.is_int32() {
+            value.to_int32() as i64
+        } else {
+            // TODO: is there a more efficient way to do this?
+            let cx = &mut context();
+            rooted!(&in(cx) let value = value.to_bigint());
+            rooted!(&in(cx) let value = unsafe { BigIntToString(cx, value.handle(), 10) });
+            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(value.get()).unwrap()) }
+                .parse()
+                .unwrap()
+        }
     }
 
     fn pop_bool(&mut self) -> bool {
-        todo!()
+        self.pop().to_boolean()
     }
 
     fn pop_char(&mut self) -> char {
-        todo!()
+        let cx = &mut context();
+        let value =
+            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(self.pop().to_string()).unwrap()) };
+        let mut chars = value.chars();
+        let value = chars.next().unwrap();
+        assert!(chars.next().is_none());
+        value
     }
 
     fn pop_f32(&mut self) -> f32 {
-        todo!()
+        // TODO: Assert that the number fits into an f32 losslessly
+        self.pop().to_number() as f32
     }
 
     fn pop_f64(&mut self) -> f64 {
-        todo!()
+        self.pop().to_number()
     }
 
     fn pop_string(&mut self) -> &str {
-        todo!()
+        let cx = &mut context();
+        let value =
+            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(self.pop().to_string()).unwrap()) };
+        self.strings.push(value);
+        self.strings.last().unwrap()
     }
 
     fn pop_borrow(&mut self, ty: wit::Resource) -> u32 {
@@ -955,87 +995,132 @@ impl Call for MyCall<'_> {
     }
 
     unsafe fn maybe_pop_list(&mut self, ty: List) -> Option<(*const u8, usize)> {
-        _ = ty;
-        todo!()
+        if let Type::U8 | Type::S8 = ty.ty() {
+            let buffer = ArrayBuffer::from(self.pop().to_object()).unwrap();
+            let len = buffer.len();
+            let dst = unsafe {
+                let dst = alloc::alloc(Layout::from_size_align(len, 1).unwrap());
+                slice::from_raw_parts_mut(dst, len).copy_from_slice(buffer.as_slice());
+                dst
+            };
+            Some((dst as _, len))
+        } else {
+            None
+        }
     }
 
     fn pop_list(&mut self, _ty: List) -> usize {
-        todo!()
+        self.iter_stack.push(0);
+        let cx = &mut context();
+        rooted!(&in(cx) let list = self.last().to_object());
+        rooted!(&in(cx) let mut length = UndefinedValue());
+        // TODO: Is there a quicker way to get the array length, e.g. using
+        // `JS_GetPropertyById`?
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                list.handle(),
+                c"length".as_ptr() as *const c_char,
+                length.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `length`")
+        }
+        length.to_int32().try_into().unwrap()
     }
 
     fn pop_iter_next(&mut self, _ty: List) {
-        todo!()
+        let index = *self.iter_stack.last().unwrap();
+        let cx = &mut context();
+        rooted!(&in(cx) let list = self.last().to_object());
+        rooted!(&in(cx) let mut value = UndefinedValue());
+        if !unsafe {
+            JS_GetElement(
+                cx,
+                list.handle(),
+                u32::try_from(index).unwrap(),
+                value.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetElement failed for `{index}`")
+        }
+        *self.iter_stack.last_mut().unwrap() = index + 1;
+        self.push(value.get());
     }
 
     fn pop_iter(&mut self, _ty: List) {
-        todo!()
+        self.iter_stack.pop().unwrap();
+        self.pop();
     }
 
     fn push_bool(&mut self, val: bool) {
-        _ = val;
-        todo!()
+        self.push(BooleanValue(val));
     }
 
     fn push_char(&mut self, val: char) {
-        _ = val;
-        todo!()
+        let cx = &mut context();
+        self.push(StringValue(unsafe {
+            &*JS_NewStringCopyUTF8N(cx, &*Utf8Chars::from(val.to_string().as_str()))
+        }));
     }
 
     fn push_u8(&mut self, val: u8) {
-        _ = val;
-        todo!()
+        self.push(UInt32Value(val as u32));
     }
 
     fn push_s8(&mut self, val: i8) {
-        _ = val;
-        todo!()
+        self.push(Int32Value(val as i32));
     }
 
     fn push_u16(&mut self, val: u16) {
-        _ = val;
-        todo!()
+        self.push(UInt32Value(val as u32));
     }
 
     fn push_s16(&mut self, val: i16) {
-        _ = val;
-        todo!()
+        self.push(Int32Value(val as i32));
     }
 
     fn push_u32(&mut self, val: u32) {
-        self.stack
-            .try_lock()
-            .unwrap()
-            .push(Heap::boxed(UInt32Value(val)));
+        self.push(UInt32Value(val));
     }
 
     fn push_s32(&mut self, val: i32) {
-        _ = val;
-        todo!()
+        self.push(Int32Value(val));
     }
 
     fn push_u64(&mut self, val: u64) {
-        _ = val;
-        todo!()
+        if let Ok(val) = u32::try_from(val) {
+            self.push(UInt32Value(val));
+        } else {
+            let cx = &mut context();
+            self.push(BigIntValue(unsafe { &*BigIntFromUint64(cx, val) }));
+        }
     }
 
     fn push_s64(&mut self, val: i64) {
-        _ = val;
-        todo!()
+        if let Ok(val) = i32::try_from(val) {
+            self.push(Int32Value(val));
+        } else {
+            let cx = &mut context();
+            self.push(BigIntValue(unsafe { &*BigIntFromInt64(cx, val) }));
+        }
     }
 
     fn push_f32(&mut self, val: f32) {
-        _ = val;
-        todo!()
+        self.push(DoubleValue(val as f64))
     }
 
     fn push_f64(&mut self, val: f64) {
-        _ = val;
-        todo!()
+        self.push(DoubleValue(val))
     }
 
     fn push_string(&mut self, val: String) {
-        _ = val;
-        todo!()
+        let cx = &mut context();
+        self.push(StringValue(unsafe {
+            &*JS_NewStringCopyUTF8N(cx, &*Utf8Chars::from(val.as_str()))
+        }));
     }
 
     fn push_record(&mut self, ty: wit::Record) {
@@ -1094,37 +1179,72 @@ impl Call for MyCall<'_> {
     }
 
     unsafe fn push_raw_list(&mut self, ty: List, src: *mut u8, len: usize) -> bool {
-        _ = (ty, src, len);
-        todo!()
+        if let Type::U8 | Type::S8 = ty.ty() {
+            let cx = &mut context();
+            rooted!(&in(cx) let mut buffer = ptr::null_mut::<JSObject>());
+            unsafe {
+                ArrayBuffer::create(
+                    cx.raw_cx(),
+                    CreateWith::Slice(slice::from_raw_parts(src, len)),
+                    buffer.handle_mut(),
+                )
+                .unwrap()
+            }
+            self.push(ObjectValue(buffer.get()));
+            true
+        } else {
+            false
+        }
     }
 
     fn push_list(&mut self, _ty: List, _capacity: usize) {
-        todo!()
+        // TODO: Ideally, we'd create a new JS Array with a length of `capacity`
+        // and then fill in the elements using `list_append`, but that would
+        // require keeping track of where we are in the array, which
+        // `wit_dylib_ffi` doesn't help us with at this point.  Consider
+        // modifying `wit_dylib_ffi` to support that (e.g. mirroring the
+        // `pop_list`/`pop_iter_next`/`pop_iter` paradigm).
+        let cx = &mut context();
+        self.push(ObjectValue(unsafe { NewArrayObject1(cx, 0) }));
     }
 
     fn list_append(&mut self, _ty: List) {
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let element = self.pop());
+        rooted!(&in(cx) let list = self.last().to_object());
+        rooted!(&in(cx) let mut push = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                list.handle(),
+                c"push".as_ptr() as *const c_char,
+                push.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `push`")
+        }
+
+        rooted!(&in(cx) let params = vec![element.get()]);
+        rooted!(&in(cx) let mut result = UndefinedValue());
+        if !unsafe {
+            JS_CallFunctionValue(
+                cx,
+                list.handle(),
+                push.handle(),
+                &HandleValueArray::from(&params),
+                result.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_CallFunctionValue failed for `push`")
+        }
     }
 }
 
 wit_dylib_ffi::export!(MyInterpreter);
 
 unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
-    unsafe {
-        CallObjectTracer(
-            tracer,
-            GLOBAL_OBJECT
-                .try_lock()
-                .unwrap()
-                .as_mut()
-                .unwrap()
-                .0
-                .ptr
-                .get() as *mut _,
-            GCTraceKindToAscii(TraceKind::Object),
-        )
-    }
-
     for stack in STACKS.try_lock().unwrap().iter() {
         for value in stack.0.try_lock().unwrap().iter_mut() {
             if value.get().is_markable() {
