@@ -1,5 +1,6 @@
 use {
     super::Ctx,
+    componentize_js::tests::echoes::{EnumType, FlagsType, RecordType, ResourceType, VariantType},
     proptest::{
         prelude::{Just, Strategy},
         test_runner::{self, TestRng, TestRunner},
@@ -9,7 +10,10 @@ use {
     tokio::{runtime::Runtime, sync::OnceCell},
     wasmtime::{
         Config, Engine, Store,
-        component::{Accessor, Component, HasSelf, Linker, ResourceTable},
+        component::{
+            Accessor, Component, FutureReader, HasSelf, Linker, Resource, ResourceTable,
+            StreamReader,
+        },
     },
     wasmtime_wasi::WasiCtxBuilder,
 };
@@ -19,6 +23,7 @@ wasmtime::component::bindgen!({
     world: "tests",
     imports: { default: async | trappable },
     exports: { default: async | task_exit },
+    additional_derives: [PartialEq, Eq],
 });
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
@@ -147,6 +152,15 @@ async fn simple_async_import_and_export() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+impl componentize_js::tests::types::HostResourceType for Ctx {
+    async fn drop(&mut self, v: Resource<ResourceType>) -> anyhow::Result<()> {
+        _ = v;
+        Ok(())
+    }
+}
+
+impl componentize_js::tests::types::Host for Ctx {}
 
 impl componentize_js::tests::echoes::Host for Ctx {
     async fn echo_nothing(&mut self) -> anyhow::Result<()> {
@@ -319,6 +333,42 @@ impl componentize_js::tests::echoes::Host for Ctx {
             v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16,
         ))
     }
+
+    async fn echo_resource(
+        &mut self,
+        v: Resource<ResourceType>,
+    ) -> anyhow::Result<Resource<ResourceType>> {
+        Ok(v)
+    }
+
+    async fn accept_borrow(&mut self, v: Resource<ResourceType>) -> anyhow::Result<()> {
+        _ = v;
+        Ok(())
+    }
+
+    async fn echo_record(&mut self, v: RecordType) -> anyhow::Result<RecordType> {
+        Ok(v)
+    }
+
+    async fn echo_enum(&mut self, v: EnumType) -> anyhow::Result<EnumType> {
+        Ok(v)
+    }
+
+    async fn echo_flags(&mut self, v: FlagsType) -> anyhow::Result<FlagsType> {
+        Ok(v)
+    }
+
+    async fn echo_variant(&mut self, v: VariantType) -> anyhow::Result<VariantType> {
+        Ok(v)
+    }
+
+    async fn echo_stream(&mut self, v: StreamReader<u8>) -> anyhow::Result<StreamReader<u8>> {
+        Ok(v)
+    }
+
+    async fn echo_future(&mut self, v: FutureReader<u8>) -> anyhow::Result<FutureReader<u8>> {
+        Ok(v)
+    }
 }
 
 fn get_seed() -> anyhow::Result<[u8; 32]> {
@@ -356,16 +406,14 @@ where
     })?)
 }
 
-#[test]
-fn echo_nothing() -> anyhow::Result<()> {
-    proptest(&Just(()), async |()| {
-        let mut store = store();
-        let instance = pre().await.instantiate_async(&mut store).await?;
-        instance
-            .componentize_js_tests_echoes()
-            .call_echo_nothing(&mut store)
-            .await
-    })
+#[tokio::test]
+async fn echo_nothing() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    instance
+        .componentize_js_tests_echoes()
+        .call_echo_nothing(&mut store)
+        .await
 }
 
 #[test]
@@ -537,15 +585,6 @@ impl PartialEq<MyF32> for MyF32 {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-struct MyF64(f64);
-
-impl PartialEq<MyF64> for MyF64 {
-    fn eq(&self, other: &Self) -> bool {
-        (self.0.is_nan() && other.0.is_nan()) || (self.0 == other.0)
-    }
-}
-
 #[test]
 fn echo_f32s() -> anyhow::Result<()> {
     proptest(&proptest::num::f32::ANY.prop_map(MyF32), async |value| {
@@ -562,6 +601,32 @@ fn echo_f32s() -> anyhow::Result<()> {
         );
         Ok(())
     })
+}
+
+#[derive(Debug, Copy, Clone)]
+struct MyF64(f64);
+
+impl PartialEq<MyF64> for MyF64 {
+    fn eq(&self, other: &Self) -> bool {
+        (self.0.is_nan() && other.0.is_nan()) || (self.0 == other.0)
+    }
+}
+
+#[tokio::test]
+async fn tmp1() -> anyhow::Result<()> {
+    let value = MyF64(f64::NAN);
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        value,
+        MyF64(
+            instance
+                .componentize_js_tests_echoes()
+                .call_echo_f64(&mut store, value.0)
+                .await?
+        )
+    );
+    Ok(())
 }
 
 #[test]
@@ -897,6 +962,24 @@ fn echo_lists_f32() -> anyhow::Result<()> {
     )
 }
 
+#[tokio::test]
+async fn tmp2() -> anyhow::Result<()> {
+    let value = vec![MyF64(f64::NAN)];
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        value,
+        instance
+            .componentize_js_tests_echoes()
+            .call_echo_list_f64(&mut store, &value.iter().map(|v| v.0).collect::<Vec<_>>())
+            .await?
+            .into_iter()
+            .map(MyF64)
+            .collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
 #[test]
 fn echo_lists_f64() -> anyhow::Result<()> {
     proptest(
@@ -967,4 +1050,181 @@ fn echo_many() -> anyhow::Result<()> {
             Ok(())
         },
     )
+}
+
+#[tokio::test]
+async fn echo_resource() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        42,
+        instance
+            .componentize_js_tests_echoes()
+            .call_echo_resource(&mut store, Resource::new_own(42))
+            .await?
+            .rep()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn accept_borrow() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    instance
+        .componentize_js_tests_echoes()
+        .call_accept_borrow(&mut store, Resource::new_borrow(42))
+        .await?;
+    Ok(())
+}
+
+#[test]
+fn echo_records() -> anyhow::Result<()> {
+    proptest(
+        &(
+            proptest::num::u32::ANY,
+            proptest::string::string_regex(".*")?,
+            proptest::bool::ANY.prop_flat_map(|v| {
+                if v {
+                    proptest::num::u32::ANY.prop_map(Ok).boxed()
+                } else {
+                    proptest::num::u64::ANY.prop_map(Err).boxed()
+                }
+            }),
+        )
+            .prop_map(|(a, b, c)| RecordType { a, b, c }),
+        async |v| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                v,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_record(&mut store, &v,)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_enums() -> anyhow::Result<()> {
+    proptest(
+        &(0..3).prop_map(|v| match v {
+            0 => EnumType::A,
+            1 => EnumType::B,
+            2 => EnumType::C,
+            _ => unreachable!(),
+        }),
+        async |v| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                v,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_enum(&mut store, v)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_flags() -> anyhow::Result<()> {
+    proptest(
+        &(
+            proptest::bool::ANY,
+            proptest::bool::ANY,
+            proptest::bool::ANY,
+        )
+            .prop_map(|(a, b, c)| {
+                let mut flags = FlagsType::default();
+                if a {
+                    flags |= FlagsType::A;
+                }
+                if b {
+                    flags |= FlagsType::B;
+                }
+                if c {
+                    flags |= FlagsType::C;
+                }
+                flags
+            }),
+        async |v| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                v,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_flags(&mut store, v)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_variants() -> anyhow::Result<()> {
+    proptest(
+        &(0..5).prop_flat_map(|v| match v {
+            0 => proptest::num::u32::ANY.prop_map(VariantType::A).boxed(),
+            1 => proptest::string::string_regex(".*")
+                .unwrap()
+                .prop_map(VariantType::B)
+                .boxed(),
+            2 => proptest::num::u32::ANY
+                .prop_map(|v| VariantType::C(Ok(v)))
+                .boxed(),
+            3 => proptest::num::u64::ANY
+                .prop_map(|v| VariantType::C(Err(v)))
+                .boxed(),
+            4 => Just(VariantType::D).boxed(),
+            _ => unreachable!(),
+        }),
+        async |v| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                v,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_variant(&mut store, &v)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[tokio::test]
+async fn echo_stream() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let stream = StreamReader::new(&mut store, vec![42]);
+    // TODO: read from returned stream and assert content matches what was
+    // produced.
+    instance
+        .componentize_js_tests_echoes()
+        .call_echo_stream(&mut store, stream)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn echo_future() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let future = FutureReader::new(&mut store, async { anyhow::Ok(42) });
+    // TODO: read from returned future and assert content matches what was
+    // produced.
+    instance
+        .componentize_js_tests_echoes()
+        .call_echo_future(&mut store, future)
+        .await?;
+    Ok(())
 }

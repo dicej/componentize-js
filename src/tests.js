@@ -114,6 +114,30 @@ var exports = {
             return imports.componentize_js_tests_echoes.echo_many(
                 v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16
             )
+        },
+        echo_resource: function(v) {
+            return imports.componentize_js_tests_echoes.echo_resource(v)
+        },
+        accept_borrow: function(v) {
+            return imports.componentize_js_tests_echoes.accept_borrow(v)
+        },
+        echo_record: function(v) {
+            return imports.componentize_js_tests_echoes.echo_record(v)
+        },
+        echo_enum: function(v) {
+            return imports.componentize_js_tests_echoes.echo_enum(v)
+        },
+        echo_flags: function(v) {
+            return imports.componentize_js_tests_echoes.echo_flags(v)
+        },
+        echo_variant: function(v) {
+            return imports.componentize_js_tests_echoes.echo_variant(v)
+        },
+        echo_stream: function(v) {
+            return imports.componentize_js_tests_echoes.echo_stream(v)
+        },
+        echo_future: function(v) {
+            return imports.componentize_js_tests_echoes.echo_future(v)
         }
     },
 }

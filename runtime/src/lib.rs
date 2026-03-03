@@ -11,13 +11,13 @@ use {
         conversions::{Utf8Chars, jsstr_to_string},
         gc::Handle,
         glue::{
-            CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
+            CallObjectTracer, CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
             JSPrincipalsCallbacks, PrintAndClearException,
         },
         jsapi::{
             GCTraceKindToAscii, HandleValueArray, Heap, JS_CallArgsFromVp, JS_GetFunctionObject,
             JS_HoldPrincipals, JSAutoRealm, JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps,
-            JSContext as RawJSContext, JSObject, JSTracer, OnNewGlobalHookOption, Value,
+            JSContext as RawJSContext, JSObject, JSTracer, OnNewGlobalHookOption, TraceKind, Value,
         },
         jsval::{
             BigIntValue, BooleanValue, DoubleValue, Int32Value, NullValue, ObjectValue,
@@ -28,10 +28,10 @@ use {
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
             wrappers2::{
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CurrentGlobalOrNull, Evaluate,
-                JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_GetElement, JS_GetProperty,
-                JS_InitDestroyPrincipalsCallback, JS_NewFunction, JS_NewGlobalObject, JS_NewObject,
-                JS_NewStringCopyUTF8N, JS_SetProperty, JS_ValueToObject, NewArrayObject,
-                NewArrayObject1, RunJobs,
+                JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_DeleteProperty1, JS_GetElement,
+                JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewFunction,
+                JS_NewGlobalObject, JS_NewObject, JS_NewStringCopyUTF8N, JS_SetProperty,
+                JS_ValueToObject, NewArrayObject, NewArrayObject1, RunJobs,
             },
         },
         typedarray::{ArrayBuffer, CreateWith},
@@ -43,7 +43,6 @@ use {
         hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
         marker::PhantomData,
         mem,
-        ops::DerefMut,
         ptr::{self, NonNull},
         slice,
         sync::{Arc, Mutex, OnceLock},
@@ -107,8 +106,17 @@ pub const STATUS_RETURNED: u32 = 2;
 pub const CALLBACK_CODE_EXIT: u32 = 0;
 pub const CALLBACK_CODE_WAIT: u32 = 2;
 
-struct Borrow;
-struct EmptyResource;
+struct Borrow {
+    value: Box<Heap<*mut JSObject>>,
+    handle: u32,
+    drop: unsafe extern "C" fn(u32),
+}
+
+struct EmptyResource {
+    value: Box<Heap<*mut JSObject>>,
+    #[expect(dead_code, reason = "will be used later")]
+    handle: u32,
+}
 
 enum Pending {
     ImportCall {
@@ -153,12 +161,76 @@ impl<T> PartialEq for ArcHash<T> {
 
 impl<T> Eq for ArcHash<T> {}
 
-type Stacks = HashSet<ArcHash<Mutex<Vec<Box<Heap<Value>>>>>, BuildHasherDefault<DefaultHasher>>;
+enum TableEntry<T> {
+    Occupied(T),
+    Free(Option<usize>),
+}
+
+struct Table<T> {
+    entries: Vec<TableEntry<T>>,
+    free: Option<usize>,
+}
+
+impl<T> Table<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            free: None,
+        }
+    }
+
+    fn insert(&mut self, v: T) -> usize {
+        if let Some(free) = self.free {
+            let &TableEntry::Free(next) = &self.entries[free] else {
+                unreachable!();
+            };
+            self.free = next;
+            self.entries[free] = TableEntry::Occupied(v);
+            free
+        } else {
+            let index = self.entries.len();
+            self.entries.push(TableEntry::Occupied(v));
+            index
+        }
+    }
+
+    fn get(&self, index: usize) -> &T {
+        let TableEntry::Occupied(value) = &self.entries[index] else {
+            unreachable!();
+        };
+        value
+    }
+
+    fn remove(&mut self, index: usize) -> T {
+        let TableEntry::Occupied(value) =
+            mem::replace(&mut self.entries[index], TableEntry::Free(self.free))
+        else {
+            unreachable!();
+        };
+        self.free = Some(index);
+        value
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().filter_map(|v| {
+            if let TableEntry::Occupied(v) = v {
+                Some(v)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+type TracedSet = HashSet<ArcHash<Mutex<Traced>>, BuildHasherDefault<DefaultHasher>>;
 
 static WIT: OnceLock<Wit> = OnceLock::new();
 static CONTEXT: OnceLock<SyncSend<NonNull<RawJSContext>>> = OnceLock::new();
-static STACKS: Mutex<Stacks> = Mutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+static TRACED: Mutex<SyncSend<TracedSet>> =
+    Mutex::new(SyncSend(HashSet::with_hasher(BuildHasherDefault::new())));
 static CURRENT_TASK_STATE: Mutex<Option<SyncSend<TaskState>>> = Mutex::new(None);
+static EXPORTED_RESOURCES: Mutex<SyncSend<Table<Box<Heap<*mut JSObject>>>>> =
+    Mutex::new(SyncSend(Table::new()));
 
 fn init_runtime() -> anyhow::Result<()> {
     let engine = JSEngine::init()
@@ -242,6 +314,28 @@ fn context() -> JSContext {
     unsafe { JSContext::from_ptr(CONTEXT.get().unwrap().0) }
 }
 
+fn release_borrows(traced: &Mutex<Traced>) {
+    let cx = &mut context();
+    while let Some(Borrow {
+        value,
+        handle,
+        drop,
+    }) = traced.try_lock().unwrap().borrows.pop()
+    {
+        rooted!(&in(cx) let value = value.get());
+        for name in [c"handle", c"componentize_js_index"] {
+            if !unsafe { JS_DeleteProperty1(cx, value.handle(), name.as_ptr() as *const c_char) } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_DeleteProperty failed for `{}`", name.to_str().unwrap())
+            }
+        }
+
+        unsafe {
+            drop(handle);
+        }
+    }
+}
+
 unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert!(argc >= 2);
 
@@ -292,9 +386,10 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
             // Push the `resolve` and `reject` callbacks onto the call stack
             // where they can be traced; we'll pop them off again when we
             // receive an `EVENT_SUBTASK`/`STATUS_RETURNED` for the subtask.
-            call.stack
+            call.traced
                 .try_lock()
                 .unwrap()
+                .stack
                 .extend([Heap::boxed(resolve.get()), Heap::boxed(reject.get())]);
 
             let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
@@ -347,11 +442,12 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
 }
 
 unsafe extern "C" fn call_task_return(_: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
-    assert_eq!(argc, 2);
+    assert_eq!(argc, 3);
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let index = args.index(0);
     let value = args.index(1);
+    let borrows = args.index(2).to_int32();
 
     let func = WIT
         .get()
@@ -364,6 +460,10 @@ unsafe extern "C" fn call_task_return(_: *mut RawJSContext, argc: u32, vp: *mut 
     }
 
     func.call_task_return(&mut call);
+
+    if borrows != 0 {
+        release_borrows(unsafe { Arc::from_raw(borrows as *const Mutex<Traced>) }.as_ref());
+    }
 
     args.rval().set(UndefinedValue());
     true
@@ -502,10 +602,11 @@ fn init(script: &str) -> anyhow::Result<()> {
                         .map(|i| format!("p{i}"))
                         .collect::<Vec<_>>()
                         .join(",");
+                    let comma = if func.params().len() == 0 { "" } else { "," };
                     format!(
-                        "{name}:function({params}){{\n\
+                        "{name}:function(t{comma}{params}){{\n\
                              return exports.{interface}{name}({params})\n\
-                             .then((v)=>componentize_js_call_task_return({index},v))}}"
+                             .then((v)=>componentize_js_call_task_return({index},v,t))}}"
                     )
                 })
                 .collect::<Vec<_>>()
@@ -672,10 +773,22 @@ impl MyInterpreter {
             panic!("JS_GetProperty failed for `{}`", name())
         }
 
-        let params = mem::take(call.stack.try_lock().unwrap().deref_mut())
-            .into_iter()
-            .map(|v| v.get())
-            .collect::<Vec<_>>();
+        let params = if async_ {
+            Some(UInt32Value(
+                (Arc::into_raw(call.traced.clone()) as usize)
+                    .try_into()
+                    .unwrap(),
+            ))
+        } else {
+            None
+        }
+        .into_iter()
+        .chain(
+            mem::take(&mut call.traced.try_lock().unwrap().stack)
+                .into_iter()
+                .map(|v| v.get()),
+        )
+        .collect::<Vec<_>>();
         rooted!(&in(cx) let params = params);
         rooted!(&in(cx) let mut result = UndefinedValue());
         if !unsafe {
@@ -697,6 +810,8 @@ impl MyInterpreter {
             if func.result().is_some() {
                 call.push(result.get());
             }
+
+            release_borrows(&call.traced);
 
             0
         }
@@ -761,7 +876,7 @@ impl Interpreter for MyInterpreter {
                     let func = WIT.get().unwrap().import_func(index);
 
                     unsafe { func.lift_import_async_result(&mut call, buffer) };
-                    assert!(call.stack.try_lock().unwrap().len() < 4);
+                    assert!(call.len() < 4);
 
                     rooted!(&in(cx) let mut result = UndefinedValue());
                     if func.result().is_some() {
@@ -798,56 +913,107 @@ impl Interpreter for MyInterpreter {
     }
 }
 
-#[expect(dead_code, clippy::vec_box)]
+struct Traced {
+    #[expect(
+        clippy::vec_box,
+        reason = "`Heap` values must be boxed to ensure they are not moved"
+    )]
+    stack: Vec<Box<Heap<Value>>>,
+    resources: Option<Vec<EmptyResource>>,
+    borrows: Vec<Borrow>,
+}
+
 struct MyCall<'a> {
     _phantom: PhantomData<&'a ()>,
     iter_stack: Vec<usize>,
     deferred_deallocations: Vec<(*mut u8, Layout)>,
     strings: Vec<String>,
-    borrows: Vec<Borrow>,
-    stack: Arc<Mutex<Vec<Box<Heap<Value>>>>>,
-    resources: Option<Vec<EmptyResource>>,
+    traced: Arc<Mutex<Traced>>,
 }
 
 impl MyCall<'_> {
+    #[expect(clippy::arc_with_non_send_sync)]
     fn new() -> Self {
-        let stack = Arc::new(Mutex::new(Vec::new()));
-        assert!(STACKS.try_lock().unwrap().insert(ArcHash(stack.clone())));
+        let traced = Arc::new(Mutex::new(Traced {
+            stack: Vec::new(),
+            resources: None,
+            borrows: Vec::new(),
+        }));
+        assert!(TRACED.try_lock().unwrap().0.insert(ArcHash(traced.clone())));
         Self {
             _phantom: PhantomData,
             iter_stack: Vec::new(),
             deferred_deallocations: Vec::new(),
             strings: Vec::new(),
-            borrows: Vec::new(),
-            stack,
-            resources: None,
+            traced,
         }
     }
 
     fn push(&mut self, value: Value) {
-        self.stack.try_lock().unwrap().push(Heap::boxed(value));
+        self.traced
+            .try_lock()
+            .unwrap()
+            .stack
+            .push(Heap::boxed(value));
     }
 
     fn pop(&mut self) -> Value {
-        self.stack.try_lock().unwrap().pop().unwrap().get()
+        self.traced.try_lock().unwrap().stack.pop().unwrap().get()
     }
 
     fn last(&self) -> Value {
-        self.stack.try_lock().unwrap().last().unwrap().get()
+        self.traced.try_lock().unwrap().stack.last().unwrap().get()
     }
 
     fn len(&self) -> usize {
-        self.stack.try_lock().unwrap().len()
+        self.traced.try_lock().unwrap().stack.len()
+    }
+
+    fn imported_resource_to_canon(&mut self, value: Value, owned: bool) -> u32 {
+        let cx = &mut context();
+        rooted!(&in(cx) let value = value.to_object());
+        rooted!(&in(cx) let mut handle = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                value.handle(),
+                c"handle".as_ptr() as *const c_char,
+                handle.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `handle`")
+        }
+        let handle = handle.to_int32() as u32;
+
+        if owned {
+            if !unsafe {
+                JS_DeleteProperty1(cx, value.handle(), c"handle".as_ptr() as *const c_char)
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_DeleteProperty failed for `handle`")
+            }
+
+            if let Some(resources) = &mut self.traced.try_lock().unwrap().resources.as_mut() {
+                resources.push(EmptyResource {
+                    value: Heap::boxed(value.get()),
+                    handle,
+                });
+            }
+        }
+
+        handle
     }
 }
 
 impl Drop for MyCall<'_> {
     fn drop(&mut self) {
         assert!(
-            STACKS
+            TRACED
                 .try_lock()
                 .unwrap()
-                .remove(&ArcHash(self.stack.clone()))
+                .0
+                .remove(&ArcHash(self.traced.clone()))
         );
 
         for &(ptr, layout) in &self.deferred_deallocations {
@@ -949,29 +1115,71 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_borrow(&mut self, ty: wit::Resource) -> u32 {
-        _ = ty;
-        todo!()
+        let value = self.pop();
+        if let Some(new) = ty.new() {
+            // exported resource type
+            exported_resource_to_canon(ty, new, value)
+        } else {
+            // imported resource type
+            self.imported_resource_to_canon(value, false)
+        }
     }
 
     fn pop_own(&mut self, ty: wit::Resource) -> u32 {
-        _ = ty;
-        todo!()
+        let value = self.pop();
+        if let Some(new) = ty.new() {
+            // exported resource type
+            exported_resource_to_canon(ty, new, value)
+        } else {
+            // imported resource type
+            self.imported_resource_to_canon(value, true)
+        }
     }
 
     fn pop_enum(&mut self, _ty: wit::Enum) -> u32 {
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = self.pop().to_object());
+        rooted!(&in(cx) let mut value = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                wrapper.handle(),
+                c"discriminant".as_ptr() as *const c_char,
+                value.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `value`")
+        }
+        value.get().to_int32() as u32
     }
 
     fn pop_flags(&mut self, _ty: wit::Flags) -> u32 {
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = self.pop().to_object());
+        rooted!(&in(cx) let mut value = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                wrapper.handle(),
+                c"value".as_ptr() as *const c_char,
+                value.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `value`")
+        }
+        value.get().to_int32() as u32
     }
 
     fn pop_future(&mut self, _ty: wit::Future) -> u32 {
-        todo!()
+        let value = self.pop();
+        self.imported_resource_to_canon(value, true)
     }
 
     fn pop_stream(&mut self, _ty: wit::Stream) -> u32 {
-        todo!()
+        let value = self.pop();
+        self.imported_resource_to_canon(value, true)
     }
 
     fn pop_option(&mut self, ty: WitOption) -> u32 {
@@ -1003,18 +1211,111 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_result(&mut self, ty: WitResult) -> u32 {
-        _ = ty;
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = self.pop().to_object());
+        rooted!(&in(cx) let mut discriminant = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                wrapper.handle(),
+                c"discriminant".as_ptr() as *const c_char,
+                discriminant.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `discriminant`")
+        }
+        let discriminant = discriminant.to_int32() as u32;
+
+        let has_payload = match discriminant {
+            0 => ty.ok().is_some(),
+            1 => ty.err().is_some(),
+            _ => unreachable!(),
+        };
+
+        if has_payload {
+            rooted!(&in(cx) let mut payload = UndefinedValue());
+            if !unsafe {
+                JS_GetProperty(
+                    cx,
+                    wrapper.handle(),
+                    c"value".as_ptr() as *const c_char,
+                    payload.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_GetProperty failed for `value3`")
+            }
+            self.push(payload.get());
+        }
+
+        discriminant
     }
 
     fn pop_variant(&mut self, ty: wit::Variant) -> u32 {
-        _ = ty;
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = self.pop().to_object());
+        rooted!(&in(cx) let mut discriminant = UndefinedValue());
+        if !unsafe {
+            JS_GetProperty(
+                cx,
+                wrapper.handle(),
+                c"discriminant".as_ptr() as *const c_char,
+                discriminant.handle_mut(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_GetProperty failed for `discriminant`")
+        }
+        let discriminant = discriminant.to_int32() as u32;
+
+        let has_payload = ty
+            .cases()
+            .nth(usize::try_from(discriminant).unwrap())
+            .unwrap()
+            .1
+            .is_some();
+
+        if has_payload {
+            rooted!(&in(cx) let mut payload = UndefinedValue());
+            if !unsafe {
+                JS_GetProperty(
+                    cx,
+                    wrapper.handle(),
+                    c"value".as_ptr() as *const c_char,
+                    payload.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_GetProperty failed for `value3`")
+            }
+            self.push(payload.get());
+        }
+
+        discriminant
     }
 
     fn pop_record(&mut self, ty: wit::Record) {
-        _ = ty;
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let record = self.pop().to_object());
+        for (name, _) in ty.fields() {
+            rooted!(&in(cx) let mut field = UndefinedValue());
+            if !unsafe {
+                JS_GetProperty(
+                    cx,
+                    record.handle(),
+                    CString::new(name.replace('-', "_"))
+                        .unwrap()
+                        .as_bytes_with_nul()
+                        .as_ptr() as *const c_char,
+                    field.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_GetProperty failed for `{name}`")
+            }
+            self.push(field.get());
+        }
     }
 
     fn pop_tuple(&mut self, ty: wit::Tuple) {
@@ -1152,11 +1453,21 @@ impl Call for MyCall<'_> {
         }
     }
 
-    fn push_f32(&mut self, val: f32) {
+    fn push_f32(&mut self, mut val: f32) {
+        if val.is_nan() {
+            // As of this writing, an assertion in `DoubleValue` will panic for
+            // certain flavors of NaN, so we canonicalize here:
+            val = f32::NAN;
+        }
         self.push(DoubleValue(val as f64))
     }
 
-    fn push_f64(&mut self, val: f64) {
+    fn push_f64(&mut self, mut val: f64) {
+        if val.is_nan() {
+            // As of this writing, an assertion in `DoubleValue` will panic for
+            // certain flavors of NaN, so we canonicalize here:
+            val = f64::NAN;
+        }
         self.push(DoubleValue(val))
     }
 
@@ -1168,18 +1479,35 @@ impl Call for MyCall<'_> {
     }
 
     fn push_record(&mut self, ty: wit::Record) {
-        _ = ty;
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let value = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+        for (name, _) in ty.fields() {
+            rooted!(&in(cx) let field = self.pop());
+            if !unsafe {
+                JS_SetProperty(
+                    cx,
+                    value.handle(),
+                    CString::new(name.replace('-', "_"))
+                        .unwrap()
+                        .as_bytes_with_nul()
+                        .as_ptr() as *const c_char,
+                    field.handle(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_SetProperty failed")
+            }
+        }
+        self.push(ObjectValue(value.get()));
     }
 
     fn push_tuple(&mut self, ty: wit::Tuple) {
-        let count = ty.types().len();
-
-        let start = self.len().checked_sub(count).unwrap();
+        let start = self.len().checked_sub(ty.types().len()).unwrap();
         let elements = self
-            .stack
+            .traced
             .try_lock()
             .unwrap()
+            .stack
             .drain(start..)
             .map(|v| v.get())
             .collect::<Vec<_>>();
@@ -1191,39 +1519,142 @@ impl Call for MyCall<'_> {
         }));
     }
 
-    fn push_flags(&mut self, ty: wit::Flags, bits: u32) {
-        _ = (ty, bits);
-        todo!()
+    fn push_flags(&mut self, _ty: wit::Flags, bits: u32) {
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+        rooted!(&in(cx) let value = UInt32Value(bits));
+        if !unsafe {
+            JS_SetProperty(
+                cx,
+                wrapper.handle(),
+                c"value".as_ptr() as *const c_char,
+                value.handle(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_SetProperty failed")
+        }
+        self.push(ObjectValue(wrapper.get()));
     }
 
-    fn push_enum(&mut self, ty: wit::Enum, discriminant: u32) {
-        _ = (ty, discriminant);
-        todo!()
+    fn push_enum(&mut self, _ty: wit::Enum, discriminant: u32) {
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+        rooted!(&in(cx) let discriminant = UInt32Value(discriminant));
+        if !unsafe {
+            JS_SetProperty(
+                cx,
+                wrapper.handle(),
+                c"discriminant".as_ptr() as *const c_char,
+                discriminant.handle(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_SetProperty failed")
+        }
+        self.push(ObjectValue(wrapper.get()));
     }
 
     fn push_borrow(&mut self, ty: wit::Resource, handle: u32) {
-        _ = (ty, handle);
-        todo!()
+        self.push(ObjectValue(if ty.rep().is_some() {
+            // exported resource type
+            EXPORTED_RESOURCES
+                .try_lock()
+                .unwrap()
+                .0
+                .get(handle.try_into().unwrap())
+                .get()
+        } else {
+            // imported resource type
+            let value = imported_resource_from_canon(ty.index(), handle);
+
+            self.traced.try_lock().unwrap().borrows.push(Borrow {
+                value: Heap::boxed(value),
+                handle,
+                drop: ty.drop(),
+            });
+
+            value
+        }));
     }
 
     fn push_own(&mut self, ty: wit::Resource, handle: u32) {
-        _ = (ty, handle);
-        todo!()
+        self.push(ObjectValue(if let Some(rep) = ty.rep() {
+            // exported resource type
+            let cx = &mut context();
+            let rep = unsafe { rep(handle) };
+            rooted!(&in(cx) let value = EXPORTED_RESOURCES.try_lock().unwrap().0.remove(rep).get());
+
+            for name in [c"componentize_js_handle", c"componentize_js_index"] {
+                if !unsafe {
+                    JS_DeleteProperty1(cx, value.handle(), name.as_ptr() as *const c_char)
+                } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_DeleteProperty failed for `{}`", name.to_str().unwrap())
+                }
+            }
+
+            value.get()
+        } else {
+            // imported resource type
+            imported_resource_from_canon(ty.index(), handle)
+        }));
     }
 
     fn push_future(&mut self, ty: wit::Future, handle: u32) {
-        _ = (ty, handle);
-        todo!()
+        self.push(ObjectValue(imported_resource_from_canon(
+            ty.index(),
+            handle,
+        )))
     }
 
     fn push_stream(&mut self, ty: wit::Stream, handle: u32) {
-        _ = (ty, handle);
-        todo!()
+        self.push(ObjectValue(imported_resource_from_canon(
+            ty.index(),
+            handle,
+        )))
     }
 
     fn push_variant(&mut self, ty: wit::Variant, discriminant: u32) {
-        _ = (ty, discriminant);
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+        {
+            rooted!(&in(cx) let discriminant = UInt32Value(discriminant));
+            if !unsafe {
+                JS_SetProperty(
+                    cx,
+                    wrapper.handle(),
+                    c"discriminant".as_ptr() as *const c_char,
+                    discriminant.handle(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_SetProperty failed")
+            }
+        }
+
+        if ty
+            .cases()
+            .nth(discriminant.try_into().unwrap())
+            .unwrap()
+            .1
+            .is_some()
+        {
+            rooted!(&in(cx) let value = self.pop());
+            if !unsafe {
+                JS_SetProperty(
+                    cx,
+                    wrapper.handle(),
+                    c"value".as_ptr() as *const c_char,
+                    value.handle(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_SetProperty failed")
+            }
+        }
+
+        self.push(ObjectValue(wrapper.get()));
     }
 
     fn push_option(&mut self, ty: WitOption, is_some: bool) {
@@ -1253,8 +1684,35 @@ impl Call for MyCall<'_> {
     }
 
     fn push_result(&mut self, ty: WitResult, is_err: bool) {
-        _ = (ty, is_err);
-        todo!()
+        let cx = &mut context();
+        rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+        rooted!(&in(cx) let discriminant = UInt32Value(if is_err { 1 } else { 0}));
+        if !unsafe {
+            JS_SetProperty(
+                cx,
+                wrapper.handle(),
+                c"discriminant".as_ptr() as *const c_char,
+                discriminant.handle(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_SetProperty failed")
+        }
+        if (is_err && ty.err().is_some()) || (!is_err && ty.ok().is_some()) {
+            rooted!(&in(cx) let value = self.pop());
+            if !unsafe {
+                JS_SetProperty(
+                    cx,
+                    wrapper.handle(),
+                    c"value".as_ptr() as *const c_char,
+                    value.handle(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_SetProperty failed")
+            }
+        }
+        self.push(ObjectValue(wrapper.get()));
     }
 
     unsafe fn push_raw_list(&mut self, ty: List, src: *mut u8, len: usize) -> bool {
@@ -1323,9 +1781,104 @@ impl Call for MyCall<'_> {
 
 wit_dylib_ffi::export!(MyInterpreter);
 
+fn imported_resource_from_canon(index: usize, handle: u32) -> *mut JSObject {
+    let cx = &mut context();
+    rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+
+    rooted!(&in(cx) let handle = UInt32Value(handle));
+    if !unsafe {
+        JS_SetProperty(
+            cx,
+            wrapper.handle(),
+            c"handle".as_ptr() as *const c_char,
+            handle.handle(),
+        )
+    } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_SetProperty failed")
+    }
+
+    rooted!(&in(cx) let index = UInt32Value(index.try_into().unwrap()));
+    if !unsafe {
+        JS_SetProperty(
+            cx,
+            wrapper.handle(),
+            c"componentize_js_type".as_ptr() as *const c_char,
+            index.handle(),
+        )
+    } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_SetProperty failed")
+    }
+
+    wrapper.get()
+}
+
+fn exported_resource_to_canon(
+    ty: wit::Resource,
+    new: unsafe extern "C" fn(usize) -> u32,
+    value: Value,
+) -> u32 {
+    let cx = &mut context();
+    rooted!(&in(cx) let value = value.to_object());
+    rooted!(&in(cx) let mut handle = UndefinedValue());
+    if !unsafe {
+        JS_GetProperty(
+            cx,
+            value.handle(),
+            c"componentize_js_handle".as_ptr() as *const c_char,
+            handle.handle_mut(),
+        )
+    } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_GetProperty failed for `componentize_js_handle`")
+    }
+
+    if handle.is_int32() {
+        handle.to_int32() as u32
+    } else {
+        let rep = EXPORTED_RESOURCES
+            .try_lock()
+            .unwrap()
+            .0
+            .insert(Heap::boxed(value.get()));
+        let handle = unsafe { new(rep as usize) };
+        {
+            rooted!(&in(cx) let handle = UInt32Value(handle));
+            if !unsafe {
+                JS_SetProperty(
+                    cx,
+                    value.handle(),
+                    c"componentize_js_handle".as_ptr() as *const c_char,
+                    handle.handle(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_SetProperty failed")
+            }
+        }
+
+        rooted!(&in(cx) let index = UInt32Value(ty.index().try_into().unwrap()));
+        if !unsafe {
+            JS_SetProperty(
+                cx,
+                value.handle(),
+                c"componentize_js_type".as_ptr() as *const c_char,
+                index.handle(),
+            )
+        } {
+            unsafe { PrintAndClearException(cx.raw_cx()) }
+            panic!("JS_SetProperty failed")
+        }
+
+        handle
+    }
+}
+
 unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
-    for stack in STACKS.try_lock().unwrap().iter() {
-        for value in stack.0.try_lock().unwrap().iter_mut() {
+    for traced in TRACED.try_lock().unwrap().0.iter() {
+        let mut traced = traced.0.try_lock().unwrap();
+        for value in traced.stack.iter_mut() {
             if value.get().is_markable() {
                 unsafe {
                     CallValueTracer(
@@ -1335,6 +1888,36 @@ unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
                     )
                 }
             }
+        }
+        for Borrow { value, .. } in traced.borrows.iter_mut() {
+            unsafe {
+                CallObjectTracer(
+                    tracer,
+                    value.ptr.get() as *mut _,
+                    GCTraceKindToAscii(TraceKind::Object),
+                )
+            }
+        }
+        if let Some(resources) = traced.resources.as_mut() {
+            for EmptyResource { value, .. } in resources.iter_mut() {
+                unsafe {
+                    CallObjectTracer(
+                        tracer,
+                        value.ptr.get() as *mut _,
+                        GCTraceKindToAscii(TraceKind::Object),
+                    )
+                }
+            }
+        }
+    }
+
+    for value in EXPORTED_RESOURCES.try_lock().unwrap().0.iter() {
+        unsafe {
+            CallObjectTracer(
+                tracer,
+                value.ptr.get() as *mut _,
+                GCTraceKindToAscii(TraceKind::Object),
+            )
         }
     }
 }
