@@ -1,21 +1,31 @@
 use {
     super::Ctx,
     componentize_js::tests::echoes::{EnumType, FlagsType, RecordType, ResourceType, VariantType},
+    exports::componentize_js::tests::streams_and_futures,
+    futures::{FutureExt as _, TryStreamExt as _, stream::FuturesUnordered},
     proptest::{
         prelude::{Just, Strategy},
         test_runner::{self, TestRng, TestRunner},
     },
     rand::RngExt,
-    std::{env, sync::LazyLock},
+    std::{
+        collections::BTreeMap,
+        env, mem,
+        ops::DerefMut,
+        pin::Pin,
+        sync::{Arc, LazyLock, Mutex},
+        task::{self, Context, Poll},
+    },
     tokio::{runtime::Runtime, sync::OnceCell},
     wasmtime::{
-        Config, Engine, Store,
+        Config, Engine, Store, StoreContextMut,
         component::{
-            Accessor, Component, FutureReader, HasSelf, Linker, Resource, ResourceTable,
-            StreamReader,
+            Accessor, Component, Destination, FutureConsumer, FutureProducer, FutureReader,
+            HasSelf, Lift, Linker, Resource, ResourceTable, Source, StreamConsumer, StreamProducer,
+            StreamReader, StreamResult, VecBuffer,
         },
     },
-    wasmtime_wasi::WasiCtxBuilder,
+    wasmtime_wasi::{WasiCtxBuilder, WasiView as _},
 };
 
 wasmtime::component::bindgen!({
@@ -24,7 +34,12 @@ wasmtime::component::bindgen!({
     imports: { default: async | trappable },
     exports: { default: async | task_exit },
     additional_derives: [PartialEq, Eq],
+    with: {
+        "componentize-js:tests/host-thing-interface.host-thing": ThingString,
+    },
 });
+
+pub struct ThingString(String);
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = Config::new();
@@ -68,6 +83,15 @@ fn store() -> Store<Ctx> {
         .build();
     let table = ResourceTable::default();
     Store::new(&ENGINE, Ctx { wasi, table })
+}
+
+impl TestsImports for Ctx {}
+
+impl TestsImportsWithStore for HasSelf<Ctx> {
+    async fn delay<T>(_: &Accessor<T, Self>) -> anyhow::Result<()> {
+        delay_via_yield().await;
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -123,13 +147,17 @@ async fn simple_import_and_export() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn delay_via_yield() {
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+}
+
 impl componentize_js::tests::simple_async_import_and_export::Host for Ctx {}
 
 impl componentize_js::tests::simple_async_import_and_export::HostWithStore for HasSelf<Ctx> {
     async fn foo<T>(_: &Accessor<T, Self>, v: u32) -> anyhow::Result<u32> {
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
+        delay_via_yield().await;
         Ok(v + 2)
     }
 }
@@ -612,23 +640,6 @@ impl PartialEq<MyF64> for MyF64 {
     }
 }
 
-#[tokio::test]
-async fn tmp1() -> anyhow::Result<()> {
-    let value = MyF64(f64::NAN);
-    let mut store = store();
-    let instance = pre().await.instantiate_async(&mut store).await?;
-    assert_eq!(
-        value,
-        MyF64(
-            instance
-                .componentize_js_tests_echoes()
-                .call_echo_f64(&mut store, value.0)
-                .await?
-        )
-    );
-    Ok(())
-}
-
 #[test]
 fn echo_f64s() -> anyhow::Result<()> {
     proptest(&proptest::num::f64::ANY.prop_map(MyF64), async |value| {
@@ -962,24 +973,6 @@ fn echo_lists_f32() -> anyhow::Result<()> {
     )
 }
 
-#[tokio::test]
-async fn tmp2() -> anyhow::Result<()> {
-    let value = vec![MyF64(f64::NAN)];
-    let mut store = store();
-    let instance = pre().await.instantiate_async(&mut store).await?;
-    assert_eq!(
-        value,
-        instance
-            .componentize_js_tests_echoes()
-            .call_echo_list_f64(&mut store, &value.iter().map(|v| v.0).collect::<Vec<_>>())
-            .await?
-            .into_iter()
-            .map(MyF64)
-            .collect::<Vec<_>>()
-    );
-    Ok(())
-}
-
 #[test]
 fn echo_lists_f64() -> anyhow::Result<()> {
     proptest(
@@ -1226,5 +1219,544 @@ async fn echo_future() -> anyhow::Result<()> {
         .componentize_js_tests_echoes()
         .call_echo_future(&mut store, future)
         .await?;
+    Ok(())
+}
+
+struct VecProducer<T> {
+    source: Vec<T>,
+    sleep: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl<T> VecProducer<T> {
+    fn new(source: Vec<T>, delay: bool) -> Self {
+        Self {
+            source,
+            sleep: if delay {
+                delay_via_yield().boxed()
+            } else {
+                async {}.boxed()
+            },
+        }
+    }
+}
+
+impl<D, T: Lift + Unpin + 'static> StreamProducer<D> for VecProducer<T> {
+    type Item = T;
+    type Buffer = VecBuffer<T>;
+
+    fn poll_produce(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: StoreContextMut<D>,
+        mut destination: Destination<Self::Item, Self::Buffer>,
+        _: bool,
+    ) -> Poll<anyhow::Result<StreamResult>> {
+        let sleep = &mut self.as_mut().get_mut().sleep;
+        task::ready!(sleep.as_mut().poll(cx));
+        *sleep = async {}.boxed();
+
+        destination.set_buffer(mem::take(&mut self.get_mut().source).into());
+        Poll::Ready(Ok(StreamResult::Dropped))
+    }
+}
+
+struct VecConsumer<T> {
+    destination: Arc<Mutex<Vec<T>>>,
+    sleep: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl<T> VecConsumer<T> {
+    fn new(destination: Arc<Mutex<Vec<T>>>, delay: bool) -> Self {
+        Self {
+            destination,
+            sleep: if delay {
+                delay_via_yield().boxed()
+            } else {
+                async {}.boxed()
+            },
+        }
+    }
+}
+
+impl<D, T: Lift + 'static> StreamConsumer<D> for VecConsumer<T> {
+    type Item = T;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut source: Source<Self::Item>,
+        _: bool,
+    ) -> Poll<anyhow::Result<StreamResult>> {
+        let sleep = &mut self.as_mut().get_mut().sleep;
+        task::ready!(sleep.as_mut().poll(cx));
+        *sleep = async {}.boxed();
+
+        source.read(store, self.destination.lock().unwrap().deref_mut())?;
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+#[tokio::test]
+async fn echo_stream_u8() -> anyhow::Result<()> {
+    test_echo_stream_u8(false).await
+}
+
+#[tokio::test]
+async fn echo_stream_u8_with_delay() -> anyhow::Result<()> {
+    test_echo_stream_u8(true).await
+}
+
+async fn test_echo_stream_u8(delay: bool) -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    store
+        .run_concurrent(async |store| {
+            let expected = b"Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
+            let stream = store
+                .with(|store| StreamReader::new(store, VecProducer::new(expected.to_vec(), delay)));
+
+            let (stream, task) = instance
+                .componentize_js_tests_streams_and_futures()
+                .call_echo_stream_u8(store, stream)
+                .await?;
+
+            let received = Arc::new(Mutex::new(Vec::with_capacity(expected.len())));
+            store.with(|store| stream.pipe(store, VecConsumer::new(received.clone(), delay)));
+
+            task.block(store).await;
+
+            assert_eq!(expected, &received.lock().unwrap()[..]);
+
+            anyhow::Ok(())
+        })
+        .await??;
+
+    Ok(())
+}
+
+struct OptionProducer<T> {
+    source: Option<T>,
+    sleep: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl<T> OptionProducer<T> {
+    fn new(source: Option<T>, delay: bool) -> Self {
+        Self {
+            source,
+            sleep: if delay {
+                delay_via_yield().boxed()
+            } else {
+                async {}.boxed()
+            },
+        }
+    }
+}
+
+impl<D, T: Unpin + Send + 'static> FutureProducer<D> for OptionProducer<T> {
+    type Item = T;
+
+    fn poll_produce(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        _: StoreContextMut<D>,
+        _: bool,
+    ) -> Poll<anyhow::Result<Option<T>>> {
+        let sleep = &mut self.as_mut().get_mut().sleep;
+        task::ready!(sleep.as_mut().poll(cx));
+        *sleep = async {}.boxed();
+
+        Poll::Ready(Ok(self.get_mut().source.take()))
+    }
+}
+
+struct OptionConsumer<T> {
+    destination: Arc<Mutex<Option<T>>>,
+    sleep: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl<T> OptionConsumer<T> {
+    fn new(destination: Arc<Mutex<Option<T>>>, delay: bool) -> Self {
+        Self {
+            destination,
+            sleep: if delay {
+                delay_via_yield().boxed()
+            } else {
+                async {}.boxed()
+            },
+        }
+    }
+}
+
+impl<D, T: Lift + 'static> FutureConsumer<D> for OptionConsumer<T> {
+    type Item = T;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut source: Source<Self::Item>,
+        _: bool,
+    ) -> Poll<anyhow::Result<()>> {
+        let sleep = &mut self.as_mut().get_mut().sleep;
+        task::ready!(sleep.as_mut().poll(cx));
+        *sleep = async {}.boxed();
+
+        source.read(store, self.destination.lock().unwrap().deref_mut())?;
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn echo_future_string() -> anyhow::Result<()> {
+    test_echo_future_string(false).await
+}
+
+#[tokio::test]
+async fn echo_future_string_with_delay() -> anyhow::Result<()> {
+    test_echo_future_string(true).await
+}
+
+async fn test_echo_future_string(delay: bool) -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    store
+        .run_concurrent(async |store| {
+            let expected = "Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
+            let future = store.with(|store| {
+                FutureReader::new(
+                    store,
+                    OptionProducer::new(Some(expected.to_string()), delay),
+                )
+            });
+
+            let (future, task) = instance
+                .componentize_js_tests_streams_and_futures()
+                .call_echo_future_string(store, future)
+                .await?;
+
+            let received = Arc::new(Mutex::new(None::<String>));
+            store.with(|store| future.pipe(store, OptionConsumer::new(received.clone(), delay)));
+
+            task.block(store).await;
+
+            assert_eq!(
+                expected,
+                received.lock().unwrap().as_ref().unwrap().as_str()
+            );
+
+            anyhow::Ok(())
+        })
+        .await??;
+
+    Ok(())
+}
+
+struct OneAtATime<T> {
+    destination: Arc<Mutex<Vec<T>>>,
+    sleep: Pin<Box<dyn Future<Output = ()> + Send>>,
+    delay: bool,
+}
+
+impl<T> OneAtATime<T> {
+    fn new(destination: Arc<Mutex<Vec<T>>>, delay: bool) -> Self {
+        Self {
+            destination,
+            sleep: if delay {
+                delay_via_yield().boxed()
+            } else {
+                async {}.boxed()
+            },
+            delay,
+        }
+    }
+}
+
+impl<D, T: Lift + 'static> StreamConsumer<D> for OneAtATime<T> {
+    type Item = T;
+
+    fn poll_consume(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<D>,
+        mut source: Source<Self::Item>,
+        _: bool,
+    ) -> Poll<anyhow::Result<StreamResult>> {
+        let delay = self.delay;
+        let sleep = &mut self.as_mut().get_mut().sleep;
+        task::ready!(sleep.as_mut().poll(cx));
+        *sleep = if delay {
+            delay_via_yield().boxed()
+        } else {
+            async {}.boxed()
+        };
+
+        let value = &mut None;
+        source.read(store, value)?;
+        self.destination.lock().unwrap().push(value.take().unwrap());
+        Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+#[tokio::test]
+async fn short_reads() -> anyhow::Result<()> {
+    test_short_reads(false).await
+}
+
+#[tokio::test]
+async fn short_reads_with_delay() -> anyhow::Result<()> {
+    test_short_reads(true).await
+}
+
+async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let instance = instance.componentize_js_tests_streams_and_futures();
+    let thing = instance.thing();
+
+    let strings = ["a", "b", "c", "d", "e"];
+    let mut things = Vec::with_capacity(strings.len());
+    for string in strings {
+        things.push(thing.call_constructor(&mut store, string).await?);
+    }
+
+    let received_things = store
+        .run_concurrent(async |store| {
+            let count = things.len();
+            // Write the items all at once.  The receiver will only read them
+            // one at a time, forcing us to retake ownership of the unwritten
+            // items between writes.
+            let stream =
+                store.with(|store| StreamReader::new(store, VecProducer::new(things, delay)));
+
+            let (stream, task) = instance.call_short_reads(store, stream).await?;
+
+            let received_things = Arc::new(Mutex::new(
+                Vec::<streams_and_futures::Thing>::with_capacity(count),
+            ));
+            // Read only one item at a time, forcing the sender to retake
+            // ownership of any unwritten items.
+            store.with(|store| stream.pipe(store, OneAtATime::new(received_things.clone(), delay)));
+
+            task.block(store).await;
+
+            assert_eq!(count, received_things.lock().unwrap().len());
+
+            let received_things = mem::take(received_things.lock().unwrap().deref_mut());
+
+            // Dispatch the `thing.get` calls concurrently to test that
+            // the runtime release borrows in async-lifted exports
+            // correctly.
+            let mut futures = FuturesUnordered::new();
+            for (index, &it) in received_things.iter().enumerate() {
+                futures.push(
+                    thing
+                        .call_get(store, it, delay)
+                        .map(move |v| v.map(move |v| (index, v))),
+                );
+            }
+
+            let mut received_strings = BTreeMap::new();
+            while let Some((index, (string, _))) = futures.try_next().await? {
+                received_strings.insert(index, string);
+            }
+
+            assert_eq!(
+                &strings[..],
+                &received_strings
+                    .values()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            anyhow::Ok(received_things)
+        })
+        .await??;
+
+    for it in received_things {
+        it.resource_drop_async(&mut store).await?;
+    }
+
+    Ok(())
+}
+
+impl componentize_js::tests::host_thing_interface::HostHostThingWithStore for HasSelf<Ctx> {
+    async fn get<T>(
+        accessor: &Accessor<T, Self>,
+        this: Resource<ThingString>,
+    ) -> anyhow::Result<String> {
+        accessor.with(|mut store| Ok(store.get().table.get(&this)?.0.clone()))
+    }
+}
+
+impl componentize_js::tests::host_thing_interface::HostHostThing for Ctx {
+    async fn new(&mut self, v: String) -> anyhow::Result<Resource<ThingString>> {
+        Ok(self.ctx().table.push(ThingString(v))?)
+    }
+
+    async fn drop(&mut self, this: Resource<ThingString>) -> anyhow::Result<()> {
+        Ok(self.ctx().table.delete(this).map(|_| ())?)
+    }
+}
+
+impl componentize_js::tests::host_thing_interface::Host for Ctx {}
+
+#[tokio::test]
+async fn short_reads_host() -> anyhow::Result<()> {
+    test_short_reads_host(false).await
+}
+
+#[tokio::test]
+async fn short_reads_host_with_delay() -> anyhow::Result<()> {
+    test_short_reads_host(true).await
+}
+
+async fn test_short_reads_host(delay: bool) -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let instance = instance.componentize_js_tests_streams_and_futures();
+
+    let strings = ["a", "b", "c", "d", "e"];
+    let mut things = Vec::with_capacity(strings.len());
+    for string in strings {
+        things.push(store.data_mut().table.push(ThingString(string.into()))?);
+    }
+
+    store
+        .run_concurrent(async |store| {
+            let count = things.len();
+            // Write the items all at once.  The receiver will only read them
+            // one at a time, forcing us to retake ownership of the unwritten
+            // items between writes.
+            let stream =
+                store.with(|store| StreamReader::new(store, VecProducer::new(things, delay)));
+
+            let (stream, task) = instance.call_short_reads_host(store, stream).await?;
+
+            let received_things = Arc::new(Mutex::new(
+                Vec::<Resource<ThingString>>::with_capacity(count),
+            ));
+            // Read only one item at a time, forcing the sender to retake
+            // ownership of any unwritten items.
+            store.with(|store| stream.pipe(store, OneAtATime::new(received_things.clone(), delay)));
+
+            task.block(store).await;
+
+            assert_eq!(count, received_things.lock().unwrap().len());
+
+            let received_strings = store.with(|mut store| {
+                mem::take(received_things.lock().unwrap().deref_mut())
+                    .into_iter()
+                    .map(|v| Ok(store.get().table.delete(v)?.0))
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })?;
+
+            assert_eq!(
+                &strings[..],
+                &received_strings
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            anyhow::Ok(())
+        })
+        .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_future_reader() -> anyhow::Result<()> {
+    test_dropped_future_reader(false).await
+}
+
+#[tokio::test]
+async fn dropped_future_reader_with_delay() -> anyhow::Result<()> {
+    test_dropped_future_reader(true).await
+}
+
+async fn test_dropped_future_reader(delay: bool) -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let instance = instance.componentize_js_tests_streams_and_futures();
+    let thing = instance.thing();
+
+    let it = store
+        .run_concurrent(async |store| {
+            let expected = "Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
+            let ((mut rx1, rx2), task) = instance
+                .call_dropped_future_reader(store, expected.into())
+                .await?;
+            // Close the future without reading the value.  This will
+            // force the sender to retake ownership of the value it
+            // tried to write.
+            rx1.close_with(store);
+
+            let received = Arc::new(Mutex::new(None::<streams_and_futures::Thing>));
+            store.with(|store| rx2.pipe(store, OptionConsumer::new(received.clone(), delay)));
+
+            task.block(store).await;
+
+            let it = received.lock().unwrap().take().unwrap();
+
+            assert_eq!(expected, &thing.call_get(store, it, false).await?.0);
+
+            anyhow::Ok(it)
+        })
+        .await??;
+
+    it.resource_drop_async(&mut store).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_future_reader_host() -> anyhow::Result<()> {
+    test_dropped_future_reader_host(false).await
+}
+
+#[tokio::test]
+async fn dropped_future_reader_host_with_delay() -> anyhow::Result<()> {
+    test_dropped_future_reader_host(true).await
+}
+
+async fn test_dropped_future_reader_host(delay: bool) -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    let instance = instance.componentize_js_tests_streams_and_futures();
+
+    store
+        .run_concurrent(async |store| {
+            let expected = "Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
+            let ((mut rx1, rx2), task) = instance
+                .call_dropped_future_reader_host(store, expected.into())
+                .await?;
+            // Close the future without reading the value.  This will
+            // force the sender to retake ownership of the value it
+            // tried to write.
+            rx1.close_with(store);
+
+            let received = Arc::new(Mutex::new(None::<Resource<ThingString>>));
+            store.with(|store| rx2.pipe(store, OptionConsumer::new(received.clone(), delay)));
+
+            task.block(store).await;
+
+            let it = store.with(|mut store| {
+                anyhow::Ok(
+                    store
+                        .get()
+                        .table
+                        .delete(received.lock().unwrap().take().unwrap())?
+                        .0,
+                )
+            })?;
+
+            assert_eq!(expected, &it);
+
+            anyhow::Ok(it)
+        })
+        .await??;
+
     Ok(())
 }

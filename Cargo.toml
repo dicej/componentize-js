@@ -31,6 +31,7 @@ wasmparser = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
 zstd = "0.13.3"
 
 [dev-dependencies]
+futures = "0.3.32"
 hex = "0.4.3"
 proptest = "1.10.0"
 rand = "0.10.0"

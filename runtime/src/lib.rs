@@ -30,8 +30,9 @@ use {
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CurrentGlobalOrNull, Evaluate,
                 JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_DeleteProperty1, JS_GetElement,
                 JS_GetProperty, JS_InitDestroyPrincipalsCallback, JS_NewFunction,
-                JS_NewGlobalObject, JS_NewObject, JS_NewStringCopyUTF8N, JS_SetProperty,
-                JS_ValueToObject, NewArrayObject, NewArrayObject1, RunJobs,
+                JS_NewGlobalObject, JS_NewObject, JS_NewStringCopyUTF8N, JS_SetElement,
+                JS_SetProperty, NewArrayObject, NewArrayObject1, NewPromiseObject, ResolvePromise,
+                RunJobs,
             },
         },
         typedarray::{ArrayBuffer, CreateWith},
@@ -39,7 +40,7 @@ use {
     std::{
         alloc::{self, Layout},
         collections::{BTreeMap, HashMap, HashSet},
-        ffi::{CString, c_char, c_void},
+        ffi::{CStr, CString, c_char, c_void},
         hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
         marker::PhantomData,
         mem,
@@ -68,43 +69,53 @@ mod bindings {
 #[link(wasm_import_module = "$root")]
 unsafe extern "C" {
     #[link_name = "[subtask-drop]"]
-    pub fn subtask_drop(task: u32);
+    fn subtask_drop(task: u32);
 }
 #[link(wasm_import_module = "$root")]
 unsafe extern "C" {
     #[link_name = "[waitable-set-new]"]
-    pub fn waitable_set_new() -> u32;
+    fn waitable_set_new() -> u32;
 }
 #[link(wasm_import_module = "$root")]
 unsafe extern "C" {
     #[link_name = "[waitable-join]"]
-    pub fn waitable_join(waitable: u32, set: u32);
+    fn waitable_join(waitable: u32, set: u32);
 }
 #[link(wasm_import_module = "$root")]
 unsafe extern "C" {
     #[link_name = "[waitable-set-drop]"]
-    pub fn waitable_set_drop(set: u32);
+    fn waitable_set_drop(set: u32);
 }
 #[link(wasm_import_module = "$root")]
 unsafe extern "C" {
     #[link_name = "[context-get-0]"]
-    pub fn context_get() -> u32;
+    fn context_get() -> u32;
 }
 #[link(wasm_import_module = "$root")]
 unsafe extern "C" {
     #[link_name = "[context-set-0]"]
-    pub fn context_set(value: u32);
+    fn context_set(value: u32);
 }
 
-pub const EVENT_NONE: u32 = 0;
-pub const EVENT_SUBTASK: u32 = 1;
+const EVENT_NONE: u32 = 0;
+const EVENT_SUBTASK: u32 = 1;
+const EVENT_STREAM_READ: u32 = 2;
+const EVENT_STREAM_WRITE: u32 = 3;
+const EVENT_FUTURE_READ: u32 = 4;
+const EVENT_FUTURE_WRITE: u32 = 5;
+const EVENT_CANCELLED: u32 = 6;
 
-pub const STATUS_STARTING: u32 = 0;
-pub const STATUS_STARTED: u32 = 1;
-pub const STATUS_RETURNED: u32 = 2;
+const STATUS_STARTING: u32 = 0;
+const STATUS_STARTED: u32 = 1;
+const STATUS_RETURNED: u32 = 2;
 
-pub const CALLBACK_CODE_EXIT: u32 = 0;
-pub const CALLBACK_CODE_WAIT: u32 = 2;
+const CALLBACK_CODE_EXIT: u32 = 0;
+const CALLBACK_CODE_WAIT: u32 = 2;
+
+const RETURN_CODE_BLOCKED: u32 = 0xFFFF_FFFF;
+const RETURN_CODE_COMPLETED: u32 = 0x0;
+const RETURN_CODE_DROPPED: u32 = 0x1;
+const RETURN_CODE_CANCELLED: u32 = 0x2;
 
 struct Borrow {
     value: Box<Heap<*mut JSObject>>,
@@ -114,8 +125,36 @@ struct Borrow {
 
 struct EmptyResource {
     value: Box<Heap<*mut JSObject>>,
-    #[expect(dead_code, reason = "will be used later")]
     handle: u32,
+}
+
+struct TransmitTraced {
+    wrapper: Box<Heap<*mut JSObject>>,
+    promise: Box<Heap<*mut JSObject>>,
+    resources: Option<Vec<Vec<EmptyResource>>>,
+}
+
+impl TransmitTraced {
+    #[expect(clippy::arc_with_non_send_sync)]
+    fn new(
+        wrapper: *mut JSObject,
+        promise: *mut JSObject,
+        resources: Option<Vec<Vec<EmptyResource>>>,
+    ) -> Arc<Mutex<Self>> {
+        let traced = Arc::new(Mutex::new(Self {
+            wrapper: Heap::boxed(wrapper),
+            promise: Heap::boxed(promise),
+            resources,
+        }));
+        assert!(
+            TRANSMIT_TRACED
+                .try_lock()
+                .unwrap()
+                .0
+                .insert(ArcHash(traced.clone()))
+        );
+        traced
+    }
 }
 
 enum Pending {
@@ -124,8 +163,44 @@ enum Pending {
         call: MyCall<'static>,
         buffer: *mut u8,
     },
-    #[expect(unused)]
-    StreamRead, // etc.
+    StreamWrite {
+        _call: MyCall<'static>,
+        traced: Arc<Mutex<TransmitTraced>>,
+    },
+    StreamRead {
+        call: MyCall<'static>,
+        buffer: *mut u8,
+        traced: Arc<Mutex<TransmitTraced>>,
+    },
+    FutureWrite {
+        _call: MyCall<'static>,
+        traced: Arc<Mutex<TransmitTraced>>,
+    },
+    FutureRead {
+        call: MyCall<'static>,
+        buffer: *mut u8,
+        traced: Arc<Mutex<TransmitTraced>>,
+    },
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        match self {
+            Self::ImportCall { .. } => {}
+            Self::StreamWrite { traced, .. }
+            | Self::StreamRead { traced, .. }
+            | Self::FutureWrite { traced, .. }
+            | Self::FutureRead { traced, .. } => {
+                assert!(
+                    TRANSMIT_TRACED
+                        .try_lock()
+                        .unwrap()
+                        .0
+                        .remove(&ArcHash(traced.clone()))
+                );
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -222,11 +297,14 @@ impl<T> Table<T> {
     }
 }
 
-type TracedSet = HashSet<ArcHash<Mutex<Traced>>, BuildHasherDefault<DefaultHasher>>;
+type MyCallTracedSet = HashSet<ArcHash<Mutex<MyCallTraced>>, BuildHasherDefault<DefaultHasher>>;
+type TransmitTracedSet = HashSet<ArcHash<Mutex<TransmitTraced>>, BuildHasherDefault<DefaultHasher>>;
 
 static WIT: OnceLock<Wit> = OnceLock::new();
 static CONTEXT: OnceLock<SyncSend<NonNull<RawJSContext>>> = OnceLock::new();
-static TRACED: Mutex<SyncSend<TracedSet>> =
+static MY_CALL_TRACED: Mutex<SyncSend<MyCallTracedSet>> =
+    Mutex::new(SyncSend(HashSet::with_hasher(BuildHasherDefault::new())));
+static TRANSMIT_TRACED: Mutex<SyncSend<TransmitTracedSet>> =
     Mutex::new(SyncSend(HashSet::with_hasher(BuildHasherDefault::new())));
 static CURRENT_TASK_STATE: Mutex<Option<SyncSend<TaskState>>> = Mutex::new(None);
 static EXPORTED_RESOURCES: Mutex<SyncSend<Table<Box<Heap<*mut JSObject>>>>> =
@@ -314,8 +392,104 @@ fn context() -> JSContext {
     unsafe { JSContext::from_ptr(CONTEXT.get().unwrap().0) }
 }
 
-fn release_borrows(traced: &Mutex<Traced>) {
-    let cx = &mut context();
+fn get(cx: &mut JSContext, object: Handle<'_, *mut JSObject>, name: &CStr) -> Value {
+    rooted!(&in(cx) let mut value = UndefinedValue());
+    // TODO: Is there a quicker way to get the array length, e.g. using
+    // `JS_GetPropertyById`?
+    if !unsafe {
+        JS_GetProperty(
+            cx,
+            object,
+            name.as_ptr() as *const c_char,
+            value.handle_mut(),
+        )
+    } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_GetProperty failed for `{}`", name.to_str().unwrap())
+    }
+    value.get()
+}
+
+fn set(
+    cx: &mut JSContext,
+    object: Handle<'_, *mut JSObject>,
+    name: &CStr,
+    value: Handle<'_, Value>,
+) {
+    if !unsafe { JS_SetProperty(cx, object, name.as_ptr() as *const c_char, value) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_SetProperty failed for `{}`", name.to_str().unwrap())
+    }
+}
+
+fn get_element(cx: &mut JSContext, object: Handle<'_, *mut JSObject>, index: u32) -> Value {
+    rooted!(&in(cx) let mut value = UndefinedValue());
+    if !unsafe { JS_GetElement(cx, object, index, value.handle_mut()) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_GetElement failed for `{index}`")
+    }
+    value.get()
+}
+
+fn set_element(
+    cx: &mut JSContext,
+    object: Handle<'_, *mut JSObject>,
+    index: u32,
+    value: Handle<'_, Value>,
+) {
+    if !unsafe { JS_SetElement(cx, object, index, value) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_SetElement failed for `{index}`")
+    }
+}
+
+fn delete(cx: &mut JSContext, object: Handle<'_, *mut JSObject>, name: &CStr) {
+    if !unsafe { JS_DeleteProperty1(cx, object, name.as_ptr() as *const c_char) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_DeleteProperty failed for `{}`", name.to_str().unwrap())
+    }
+}
+
+fn call(
+    cx: &mut JSContext,
+    object: Handle<'_, *mut JSObject>,
+    fun: Handle<'_, Value>,
+    args: &HandleValueArray,
+) -> Value {
+    rooted!(&in(cx) let mut result = UndefinedValue());
+    if !unsafe { JS_CallFunctionValue(cx, object, fun, args, result.handle_mut()) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_CallFunctionValue failed")
+    }
+    result.get()
+}
+
+fn wrap(cx: &mut JSContext, fun: JsFunction) -> Value {
+    ObjectValue(unsafe {
+        JS_GetFunctionObject(JS_NewFunction(
+            cx,
+            Some(fun),
+            // TODO: how is this argument used, if at all?
+            0,
+            0,
+            ptr::null(),
+        ))
+    })
+}
+
+fn resolve(cx: &mut JSContext, promise: Handle<'_, *mut JSObject>, value: Handle<'_, Value>) {
+    if !unsafe { ResolvePromise(cx, promise, value) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("ResolvePromise failed")
+    }
+}
+
+fn release_borrows(cx: &mut JSContext, traced: &Mutex<MyCallTraced>) {
+    // Note that we're careful here to leave all but the current borrow in
+    // `traced` (and immediately root the `Borrow::value` before doing anything
+    // else with the current borrow) to ensure the others remain visible and
+    // update-able to the GC.
+
     while let Some(Borrow {
         value,
         handle,
@@ -323,16 +497,47 @@ fn release_borrows(traced: &Mutex<Traced>) {
     }) = traced.try_lock().unwrap().borrows.pop()
     {
         rooted!(&in(cx) let value = value.get());
-        for name in [c"handle", c"componentize_js_index"] {
-            if !unsafe { JS_DeleteProperty1(cx, value.handle(), name.as_ptr() as *const c_char) } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_DeleteProperty failed for `{}`", name.to_str().unwrap())
-            }
+        for name in [c"componentize_js_handle", c"componentize_js_type"] {
+            delete(cx, value.handle(), name);
         }
 
         unsafe {
             drop(handle);
         }
+    }
+}
+
+fn restore_resources(cx: &mut JSContext, traced: &Mutex<TransmitTraced>, count: u32) {
+    // Note that we're careful here to leave all but the current
+    // resource in `traced` (and immediately root the GC-able fields
+    // before doing anything else with the current resource) to
+    // ensure the others remain visible and update-able to the GC.
+
+    let pop_resource = || {
+        if let Some(resources) = traced.try_lock().unwrap().resources.as_mut() {
+            let count = usize::try_from(count).unwrap();
+            while resources.len() > count {
+                let last = resources.last_mut().unwrap();
+                let last_last = last.pop();
+                if last_last.is_some() {
+                    return last_last;
+                } else {
+                    resources.pop();
+                }
+            }
+        }
+        None
+    };
+
+    while let Some(resource) = pop_resource() {
+        rooted!(&in(cx) let wrapper = resource.value.get());
+        rooted!(&in(cx) let handle = UInt32Value(resource.handle));
+        set(
+            cx,
+            wrapper.handle(),
+            c"componentize_js_handle",
+            handle.handle(),
+        );
     }
 }
 
@@ -344,22 +549,9 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let index = args.index(0);
     let params = args.index(1);
     rooted!(&in(cx) let params = params.to_object());
-    rooted!(&in(cx) let mut length = UndefinedValue());
     // TODO: Is there a quicker way to get the array length, e.g. using
     // `JS_GetPropertyById`?
-    if !unsafe {
-        JS_GetProperty(
-            cx,
-            params.handle(),
-            c"length".as_ptr() as *const c_char,
-            length.handle_mut(),
-        )
-    } {
-        unsafe { PrintAndClearException(cx.raw_cx()) }
-        panic!("JS_GetProperty failed for `length`")
-    }
-
-    let length = u32::try_from(length.to_int32()).unwrap();
+    let length = u32::try_from(get(cx, params.handle(), c"length").to_int32()).unwrap();
     let func = WIT
         .get()
         .unwrap()
@@ -368,12 +560,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
 
     let mut call = MyCall::new();
     for index in 0..length {
-        rooted!(&in(cx) let mut value = UndefinedValue());
-        if !unsafe { JS_GetElement(cx, params.handle(), length - index - 1, value.handle_mut()) } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetElement failed for `{index}`")
-        }
-        call.push(value.get());
+        call.push(get_element(cx, params.handle(), length - index - 1));
     }
 
     if func.is_async() {
@@ -412,19 +599,12 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
                 result.set(call.pop());
             }
             rooted!(&in(cx) let params = vec![result.get()]);
-            rooted!(&in(cx) let mut result = UndefinedValue());
-            if !unsafe {
-                JS_CallFunctionValue(
-                    cx,
-                    Handle::<*mut JSObject>::null(),
-                    Handle::from_raw(resolve),
-                    &HandleValueArray::from(&params),
-                    result.handle_mut(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_CallFunctionValue failed for `resolve`")
-            }
+            self::call(
+                cx,
+                Handle::<*mut JSObject>::null(),
+                unsafe { Handle::from_raw(resolve) },
+                &HandleValueArray::from(&params),
+            );
         }
 
         args.rval().set(UndefinedValue())
@@ -441,20 +621,19 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     true
 }
 
-unsafe extern "C" fn call_task_return(_: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+unsafe extern "C" fn call_task_return(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert_eq!(argc, 3);
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let index = args.index(0);
     let value = args.index(1);
     let borrows = args.index(2).to_int32();
-
     let func = WIT
         .get()
         .unwrap()
         .export_func(usize::try_from(index.to_int32()).unwrap());
-
     let mut call = MyCall::new();
+
     if func.result().is_some() {
         call.push(value.get());
     }
@@ -462,7 +641,10 @@ unsafe extern "C" fn call_task_return(_: *mut RawJSContext, argc: u32, vp: *mut 
     func.call_task_return(&mut call);
 
     if borrows != 0 {
-        release_borrows(unsafe { Arc::from_raw(borrows as *const Mutex<Traced>) }.as_ref());
+        release_borrows(
+            &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) },
+            unsafe { Arc::from_raw(borrows as *const Mutex<MyCallTraced>) }.as_ref(),
+        );
     }
 
     args.rval().set(UndefinedValue());
@@ -475,6 +657,576 @@ unsafe extern "C" fn log(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bo
     let message = unsafe { jsstr_to_string(cx, NonNull::new(args.index(0).to_string()).unwrap()) };
     eprintln!("log: `{message}`");
     args.rval().set(UndefinedValue());
+    true
+}
+
+unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type").to_int32() as u32;
+    let handle = get(cx, this.handle(), c"componentize_js_handle").to_int32() as u32;
+    rooted!(&in(cx) let values = args.index(0).to_object());
+    let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
+
+    let write_count = if let Some(Type::U8 | Type::S8) = ty.ty() {
+        ArrayBuffer::from(values.get()).unwrap().len()
+    } else {
+        // TODO: Is there a quicker way to get the array length, e.g. using
+        // `JS_GetPropertyById`?
+        usize::try_from(get(cx, values.handle(), c"length").to_int32()).unwrap()
+    };
+
+    let layout =
+        Layout::from_size_align(ty.abi_payload_size() * write_count, ty.abi_payload_align())
+            .unwrap();
+    let buffer = unsafe { std::alloc::alloc(layout) };
+    if buffer.is_null() {
+        panic!("unable to allocate buffer for stream write");
+    }
+
+    let mut call = MyCall::new();
+    unsafe { call.defer_deallocate(buffer, layout) };
+
+    rooted!(&in(cx) let promise = unsafe { NewPromiseObject(cx, Handle::<*mut JSObject>::null()) });
+
+    let traced = TransmitTraced::new(this.get(), promise.get(), None);
+
+    if let Some(Type::U8 | Type::S8) = ty.ty() {
+        let js_buffer = ArrayBuffer::from(args.index(0).to_object()).unwrap();
+        // TODO: Can we avoid the copy here by telling SpiderMonkey to pin the
+        // buffer so it can't be moved, collected, or resized until we've
+        // unpinned it?
+        unsafe {
+            slice::from_raw_parts_mut(buffer, write_count).copy_from_slice(js_buffer.as_slice())
+        };
+    } else {
+        let mut need_restore_resources = false;
+        traced.try_lock().unwrap().resources = Some(Vec::with_capacity(write_count));
+        for offset in 0..write_count {
+            call.push(get_element(
+                cx,
+                values.handle(),
+                u32::try_from(offset).unwrap(),
+            ));
+            call.traced.try_lock().unwrap().resources = Some(Vec::new());
+            unsafe { ty.lower(&mut call, buffer.add(ty.abi_payload_size() * offset)) };
+            let res = call.traced.try_lock().unwrap().resources.take().unwrap();
+            if !res.is_empty() {
+                need_restore_resources = true;
+            }
+            traced
+                .try_lock()
+                .unwrap()
+                .resources
+                .as_mut()
+                .unwrap()
+                .push(res);
+        }
+
+        if !need_restore_resources {
+            traced.try_lock().unwrap().resources = None;
+        }
+    }
+
+    let code = unsafe { ty.write()(handle, buffer.cast(), write_count) };
+
+    if code == RETURN_CODE_BLOCKED {
+        let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
+        let state = &mut state.as_mut().unwrap().0;
+        if state.waitable_set.is_none() {
+            state.waitable_set = Some(unsafe { waitable_set_new() });
+        }
+        unsafe { waitable_join(handle, state.waitable_set.unwrap()) }
+
+        state.pending.insert(
+            handle,
+            Pending::StreamWrite {
+                _call: call,
+                traced,
+            },
+        );
+    } else {
+        let count = code >> 4;
+        let code = code & 0xF;
+
+        restore_resources(cx, &traced, count);
+
+        if code == RETURN_CODE_DROPPED {
+            rooted!(&in(cx) let value = BooleanValue(true));
+            set(cx, this.handle(), c"reader_dropped", value.handle());
+        }
+        rooted!(&in(cx) let value = UInt32Value(count));
+        resolve(cx, promise.handle(), value.handle());
+    }
+
+    args.rval().set(ObjectValue(promise.get()));
+
+    true
+}
+
+unsafe extern "C" fn stream_drop_writable(
+    cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut Value,
+) -> bool {
+    assert_eq!(argc, 0);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type");
+    let handle = get(cx, this.handle(), c"componentize_js_handle");
+
+    if index.is_int32() && handle.is_int32() {
+        let index = index.to_int32() as u32;
+        let handle = handle.to_int32() as u32;
+        let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
+
+        unsafe { ty.drop_writable()(handle) };
+
+        for name in [c"componentize_js_handle", c"componentize_js_type"] {
+            delete(cx, this.handle(), name);
+        }
+    }
+
+    args.rval().set(UndefinedValue());
+    true
+}
+
+unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type").to_int32() as u32;
+    let handle = get(cx, this.handle(), c"componentize_js_handle").to_int32() as u32;
+    let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
+
+    let max_count = usize::try_from(args.index(0).to_int32() as u32).unwrap();
+    let layout =
+        Layout::from_size_align(ty.abi_payload_size() * max_count, ty.abi_payload_align()).unwrap();
+    let buffer = unsafe { std::alloc::alloc(layout) };
+    if buffer.is_null() {
+        panic!("unable to allocate buffer for stream read");
+    }
+
+    let mut call = MyCall::new();
+    unsafe { call.defer_deallocate(buffer, layout) };
+
+    let code = unsafe { ty.read()(handle, buffer.cast(), max_count) };
+
+    rooted!(&in(cx) let promise = unsafe { NewPromiseObject(cx, Handle::<*mut JSObject>::null()) });
+
+    if code == RETURN_CODE_BLOCKED {
+        let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
+        let state = &mut state.as_mut().unwrap().0;
+        if state.waitable_set.is_none() {
+            state.waitable_set = Some(unsafe { waitable_set_new() });
+        }
+        unsafe { waitable_join(handle, state.waitable_set.unwrap()) }
+
+        state.pending.insert(
+            handle,
+            Pending::StreamRead {
+                call,
+                buffer,
+                traced: TransmitTraced::new(this.get(), promise.get(), None),
+            },
+        );
+    } else {
+        let count = usize::try_from(code >> 4).unwrap();
+        let code = code & 0xF;
+        if code == RETURN_CODE_DROPPED {
+            rooted!(&in(cx) let value = BooleanValue(true));
+            set(cx, this.handle(), c"writer_dropped", value.handle());
+        }
+
+        if let Some(Type::U8 | Type::S8) = ty.ty() {
+            rooted!(&in(cx) let mut js_buffer = ptr::null_mut::<JSObject>());
+            unsafe {
+                ArrayBuffer::create(
+                    cx.raw_cx(),
+                    CreateWith::Slice(slice::from_raw_parts(buffer, count)),
+                    js_buffer.handle_mut(),
+                )
+                .unwrap()
+            }
+            rooted!(&in(cx) let value = ObjectValue(js_buffer.get()));
+            resolve(cx, promise.handle(), value.handle());
+        } else {
+            rooted!(&in(cx) let array = unsafe { NewArrayObject1(cx, count) });
+            for offset in 0..count {
+                unsafe { ty.lift(&mut call, buffer.add(ty.abi_payload_size() * offset)) };
+                rooted!(&in(cx) let value = call.pop());
+                set_element(
+                    cx,
+                    array.handle(),
+                    offset.try_into().unwrap(),
+                    value.handle(),
+                );
+            }
+            rooted!(&in(cx) let value = ObjectValue(array.get()));
+            resolve(cx, promise.handle(), value.handle());
+        }
+    }
+
+    args.rval().set(ObjectValue(promise.get()));
+
+    true
+}
+
+unsafe extern "C" fn stream_drop_readable(
+    cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut Value,
+) -> bool {
+    assert_eq!(argc, 0);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type");
+    let handle = get(cx, this.handle(), c"componentize_js_handle");
+
+    if index.is_int32() && handle.is_int32() {
+        let index = index.to_int32() as u32;
+        let handle = handle.to_int32() as u32;
+        let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
+
+        unsafe { ty.drop_readable()(handle) };
+
+        for name in [c"componentize_js_handle", c"componentize_js_type"] {
+            delete(cx, this.handle(), name);
+        }
+    }
+
+    args.rval().set(UndefinedValue());
+    true
+}
+
+unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let index = args.index(0);
+    let ty = WIT
+        .get()
+        .unwrap()
+        .stream(usize::try_from(index.to_int32()).unwrap());
+    let handles = unsafe { ty.new()() };
+    let tx_handle = u32::try_from(handles >> 32).unwrap();
+    let rx_handle = u32::try_from(handles & 0xFFFF_FFFF).unwrap();
+
+    rooted!(&in(cx) let tx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+    set(cx, tx.handle(), c"componentize_js_type", unsafe {
+        Handle::from_raw(index)
+    });
+    rooted!(&in(cx) let tx_handle = UInt32Value(tx_handle));
+    set(
+        cx,
+        tx.handle(),
+        c"componentize_js_handle",
+        tx_handle.handle(),
+    );
+
+    for (name, func) in [
+        (c"write", stream_write as JsFunction),
+        (c"drop", stream_drop_writable as JsFunction),
+    ] {
+        rooted!(&in(cx) let mut func = wrap(cx, func));
+        set(cx, tx.handle(), name, func.handle());
+    }
+    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+    rooted!(&in(cx) let write_all = get(cx, global_object.handle(), c"componentize_js_write_all"));
+    set(cx, tx.handle(), c"write_all", write_all.handle());
+
+    rooted!(&in(cx) let rx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+    set(cx, rx.handle(), c"componentize_js_type", unsafe {
+        Handle::from_raw(index)
+    });
+    rooted!(&in(cx) let rx_handle = UInt32Value(rx_handle));
+    set(
+        cx,
+        rx.handle(),
+        c"componentize_js_handle",
+        rx_handle.handle(),
+    );
+
+    for (name, func) in [
+        (c"read", stream_read as JsFunction),
+        (c"drop", stream_drop_readable as JsFunction),
+    ] {
+        rooted!(&in(cx) let mut func = wrap(cx, func));
+        set(cx, rx.handle(), name, func.handle());
+    }
+
+    rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
+    args.rval().set(ObjectValue(unsafe {
+        NewArrayObject(cx, &HandleValueArray::from(&elements))
+    }));
+
+    true
+}
+
+unsafe extern "C" fn future_write(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    // TODO: Detect and raise exception if future has already been written or
+    // dropped.
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type").to_int32() as u32;
+    let handle = get(cx, this.handle(), c"componentize_js_handle").to_int32() as u32;
+    let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
+
+    let layout = Layout::from_size_align(ty.abi_payload_size(), ty.abi_payload_align()).unwrap();
+    let buffer = unsafe { std::alloc::alloc(layout) };
+    if buffer.is_null() {
+        panic!("unable to allocate buffer for stream read");
+    }
+
+    let mut call = MyCall::new();
+    call.push(args.index(0).get());
+    unsafe { call.defer_deallocate(buffer, layout) };
+
+    call.traced.try_lock().unwrap().resources = Some(Vec::new());
+    let code = unsafe {
+        ty.lower(&mut call, buffer);
+        ty.write()(handle, buffer.cast())
+    };
+
+    rooted!(&in(cx) let promise = unsafe { NewPromiseObject(cx, Handle::<*mut JSObject>::null()) });
+    let traced = TransmitTraced::new(
+        this.get(),
+        promise.get(),
+        call.traced
+            .try_lock()
+            .unwrap()
+            .resources
+            .take()
+            .and_then(|v| if v.is_empty() { None } else { Some(vec![v]) }),
+    );
+
+    if code == RETURN_CODE_BLOCKED {
+        let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
+        let state = &mut state.as_mut().unwrap().0;
+        if state.waitable_set.is_none() {
+            state.waitable_set = Some(unsafe { waitable_set_new() });
+        }
+        unsafe { waitable_join(handle, state.waitable_set.unwrap()) }
+
+        state.pending.insert(
+            handle,
+            Pending::FutureWrite {
+                _call: call,
+                traced,
+            },
+        );
+    } else {
+        let code = code & 0xF;
+
+        if code == RETURN_CODE_DROPPED {
+            restore_resources(cx, &traced, 0);
+        }
+
+        let result = match code {
+            self::RETURN_CODE_COMPLETED => true,
+            self::RETURN_CODE_DROPPED => false,
+            self::RETURN_CODE_CANCELLED => todo!(),
+            _ => unreachable!(),
+        };
+        rooted!(&in(cx) let value = BooleanValue(result));
+        resolve(cx, promise.handle(), value.handle());
+    }
+
+    args.rval().set(ObjectValue(promise.get()));
+
+    true
+}
+
+unsafe extern "C" fn future_drop_writable(
+    cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut Value,
+) -> bool {
+    assert_eq!(argc, 0);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type");
+    let handle = get(cx, this.handle(), c"componentize_js_handle");
+
+    if index.is_int32() && handle.is_int32() {
+        let index = index.to_int32() as u32;
+        let handle = handle.to_int32() as u32;
+        let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
+
+        unsafe { ty.drop_writable()(handle) };
+
+        for name in [c"componentize_js_handle", c"componentize_js_type"] {
+            delete(cx, this.handle(), name);
+        }
+    }
+
+    args.rval().set(UndefinedValue());
+    true
+}
+
+unsafe extern "C" fn future_read(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 0);
+
+    // TODO: Detect and raise exception if future has already been read or
+    // dropped.
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type").to_int32() as u32;
+    let handle = get(cx, this.handle(), c"componentize_js_handle").to_int32() as u32;
+    let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
+
+    let layout = Layout::from_size_align(ty.abi_payload_size(), ty.abi_payload_align()).unwrap();
+    let buffer = unsafe { std::alloc::alloc(layout) };
+    if buffer.is_null() {
+        panic!("unable to allocate buffer for future read");
+    }
+
+    let mut call = MyCall::new();
+    unsafe { call.defer_deallocate(buffer, layout) };
+
+    let code = unsafe { ty.read()(handle, buffer.cast()) };
+
+    rooted!(&in(cx) let promise = unsafe { NewPromiseObject(cx, Handle::<*mut JSObject>::null()) });
+
+    if code == RETURN_CODE_BLOCKED {
+        let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
+        let state = &mut state.as_mut().unwrap().0;
+        if state.waitable_set.is_none() {
+            state.waitable_set = Some(unsafe { waitable_set_new() });
+        }
+        unsafe { waitable_join(handle, state.waitable_set.unwrap()) }
+
+        state.pending.insert(
+            handle,
+            Pending::FutureRead {
+                call,
+                buffer,
+                traced: TransmitTraced::new(this.get(), promise.get(), None),
+            },
+        );
+    } else {
+        let code = code & 0xF;
+        match code {
+            self::RETURN_CODE_COMPLETED => unsafe { ty.lift(&mut call, buffer) },
+            self::RETURN_CODE_DROPPED => unreachable!(),
+            self::RETURN_CODE_CANCELLED => todo!(),
+            _ => unreachable!(),
+        }
+        rooted!(&in(cx) let value = call.pop());
+        resolve(cx, promise.handle(), value.handle());
+    }
+
+    args.rval().set(ObjectValue(promise.get()));
+
+    true
+}
+
+unsafe extern "C" fn future_drop_readable(
+    cx: *mut RawJSContext,
+    argc: u32,
+    vp: *mut Value,
+) -> bool {
+    assert_eq!(argc, 0);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), c"componentize_js_type");
+    let handle = get(cx, this.handle(), c"componentize_js_handle");
+
+    if index.is_int32() && handle.is_int32() {
+        let index = index.to_int32() as u32;
+        let handle = handle.to_int32() as u32;
+        let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
+
+        unsafe { ty.drop_readable()(handle) };
+
+        for name in [c"componentize_js_handle", c"componentize_js_type"] {
+            delete(cx, this.handle(), name);
+        }
+    }
+
+    args.rval().set(UndefinedValue());
+    true
+}
+
+unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let index = args.index(0);
+    let ty = WIT
+        .get()
+        .unwrap()
+        .future(usize::try_from(index.to_int32()).unwrap());
+    let handles = unsafe { ty.new()() };
+    let tx_handle = u32::try_from(handles >> 32).unwrap();
+    let rx_handle = u32::try_from(handles & 0xFFFF_FFFF).unwrap();
+
+    rooted!(&in(cx) let tx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+    set(cx, tx.handle(), c"componentize_js_type", unsafe {
+        Handle::from_raw(index)
+    });
+    rooted!(&in(cx) let tx_handle = UInt32Value(tx_handle));
+    set(
+        cx,
+        tx.handle(),
+        c"componentize_js_handle",
+        tx_handle.handle(),
+    );
+
+    for (name, func) in [
+        (c"write", future_write as JsFunction),
+        (c"drop", future_drop_writable as JsFunction),
+    ] {
+        rooted!(&in(cx) let mut func = wrap(cx, func));
+        set(cx, tx.handle(), name, func.handle());
+    }
+
+    rooted!(&in(cx) let rx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+    set(cx, rx.handle(), c"componentize_js_type", unsafe {
+        Handle::from_raw(index)
+    });
+    rooted!(&in(cx) let rx_handle = UInt32Value(rx_handle));
+    set(
+        cx,
+        rx.handle(),
+        c"componentize_js_handle",
+        rx_handle.handle(),
+    );
+
+    for (name, func) in [
+        (c"read", future_read as JsFunction),
+        (c"drop", future_drop_readable as JsFunction),
+    ] {
+        rooted!(&in(cx) let mut func = wrap(cx, func));
+        set(cx, rx.handle(), name, func.handle());
+    }
+
+    rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
+    args.rval().set(ObjectValue(unsafe {
+        NewArrayObject(cx, &HandleValueArray::from(&elements))
+    }));
+
     true
 }
 
@@ -491,23 +1243,12 @@ fn init(script: &str) -> anyhow::Result<()> {
             call_task_return as JsFunction,
         ),
         (c"componentize_js_log", log as JsFunction),
+        (c"componentize_js_make_stream", make_stream as JsFunction),
+        (c"componentize_js_make_future", make_future as JsFunction),
     ] {
-        let func = unsafe { JS_NewFunction(cx, Some(func), 2, 0, ptr::null()) };
-        rooted!(&in(cx) let mut func = ObjectValue(unsafe {
-            JS_GetFunctionObject(func)
-        }));
+        rooted!(&in(cx) let mut func = wrap(cx, func));
         rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-        if !unsafe {
-            JS_SetProperty(
-                cx,
-                global_object.handle(),
-                name.as_ptr() as *const c_char,
-                func.handle(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            bail!("JS_SetProperty failed")
-        }
+        set(cx, global_object.handle(), name, func.handle());
     }
 
     // Next, generate JS code which will add an `imports` property to the
@@ -531,7 +1272,7 @@ fn init(script: &str) -> anyhow::Result<()> {
             let funcs = funcs
                 .into_iter()
                 .map(|(index, func)| {
-                    let name = func.name().replace('-', "_");
+                    let name = mangle_name(func.name());
                     let params = (0..func.params().len())
                         .map(|i| format!("p{i}"))
                         .collect::<Vec<_>>()
@@ -539,7 +1280,7 @@ fn init(script: &str) -> anyhow::Result<()> {
                     let value = if func.is_async() {
                         format!(
                             "new Promise((a,b)=>\
-                                 componentize_js_call_import({index},[{params}],a,b))"
+                             componentize_js_call_import({index},[{params}],a,b))"
                         )
                     } else {
                         format!("componentize_js_call_import({index},[{params}])")
@@ -550,7 +1291,7 @@ fn init(script: &str) -> anyhow::Result<()> {
                 .join(",");
 
             if let Some(interface) = interface {
-                let name = interface.replace([':', '/', '-'], "_");
+                let name = mangle_name(interface);
                 format!("{name}:{{{funcs}}}")
             } else {
                 funcs
@@ -578,6 +1319,59 @@ fn init(script: &str) -> anyhow::Result<()> {
             .push((index, func));
     }
 
+    // Next, generate JS code which will add a
+    // `componentize_js_types` property to the global object which
+    // will provide constructors for any and all future and stream types.
+    //
+    // TODO: As above, move this code to the host side of `componentize-js`.
+    let types = WIT
+        .get()
+        .unwrap()
+        .iter_streams()
+        .enumerate()
+        .map(|(index, stream)| {
+            let name = if let Some(ty) = stream.ty() {
+                let payload = mangle_ty(ty);
+                format!("{payload}_stream")
+            } else {
+                "unit_stream".into()
+            };
+            format!("{name}:function(){{return componentize_js_make_stream({index})}}")
+        })
+        .chain(
+            WIT.get()
+                .unwrap()
+                .iter_futures()
+                .enumerate()
+                .map(|(index, future)| {
+                    let name = if let Some(ty) = future.ty() {
+                        let payload = mangle_ty(ty);
+                        format!("{payload}_future")
+                    } else {
+                        "unit_future".into()
+                    };
+                    format!("{name}:function(){{return componentize_js_make_future({index})}}")
+                }),
+        )
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Next, generate a bit of JS utility code for use with streams.
+    //
+    // TODO: As above, move this code to the host side of `componentize-js`.
+    let write_all = "async function(buffer) {
+  let total = 0
+  while (((buffer.byteLength !== undefined && buffer.byteLength > 0)
+          || (buffer.length !== undefined && buffer.length > 0))
+         && !this.reader_dropped)
+  {
+    count = await this.write(buffer)
+    buffer = buffer.slice(count)
+    total += count
+  }
+  return total
+}";
+
     // For some reason I have not yet determined, we need an `await` to
     // appear somewhere in the script to force `Promise` to be in scope.
     //
@@ -589,7 +1383,7 @@ fn init(script: &str) -> anyhow::Result<()> {
     let exports = exports
         .into_iter()
         .map(|(interface, funcs)| {
-            let interface = interface.map(|v| v.replace([':', '/', '-'], "_"));
+            let interface = interface.map(mangle_name);
             let funcs = funcs
                 .into_iter()
                 .map(|(index, func)| {
@@ -597,7 +1391,7 @@ fn init(script: &str) -> anyhow::Result<()> {
                         .as_ref()
                         .map(|v| format!("{v}."))
                         .unwrap_or_else(String::new);
-                    let name = func.name().replace('-', "_");
+                    let name = mangle_name(func.name());
                     let params = (0..func.params().len())
                         .map(|i| format!("p{i}"))
                         .collect::<Vec<_>>()
@@ -605,8 +1399,8 @@ fn init(script: &str) -> anyhow::Result<()> {
                     let comma = if func.params().len() == 0 { "" } else { "," };
                     format!(
                         "{name}:function(t{comma}{params}){{\n\
-                             return exports.{interface}{name}({params})\n\
-                             .then((v)=>componentize_js_call_task_return({index},v,t))}}"
+                         return exports.{interface}{name}({params})\n\
+                         .then((v)=>componentize_js_call_task_return({index},v,t))}}"
                     )
                 })
                 .collect::<Vec<_>>()
@@ -625,9 +1419,11 @@ fn init(script: &str) -> anyhow::Result<()> {
     // result.
     let script = format!(
         "{script}\n\
-             var imports = {{{imports}}}\n\
-             var componentize_js_async_exports = {{{exports}}}\n\
-             {promise_hack}"
+         var imports = {{{imports}}}\n\
+         var componentize_js_async_exports = {{{exports}}}\n\
+         var componentize_js_types = {{{types}}}\n\
+         var componentize_js_write_all = {write_all}\n\
+         {promise_hack}"
     );
     let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
     let script = script.encode_utf16().collect::<Vec<_>>();
@@ -695,82 +1491,43 @@ struct MyInterpreter;
 
 impl MyInterpreter {
     fn export_call_(func: ExportFunction, call: &mut MyCall<'_>, async_: bool) -> u32 {
-        let name = || {
-            if let Some(interface) = func.interface() {
-                format!("{interface}#{}", func.name())
-            } else {
-                func.name().into()
-            }
-        };
-
         if async_ {
             *CURRENT_TASK_STATE.try_lock().unwrap() = Some(SyncSend(TaskState::default()));
         }
 
         let cx = &mut context();
         rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-        rooted!(&in(cx) let mut object = ptr::null_mut::<JSObject>());
-
-        {
-            rooted!(&in(cx) let mut value = UndefinedValue());
-            if !unsafe {
-                JS_GetProperty(
-                    cx,
-                    global_object.handle(),
-                    if async_ {
-                        c"componentize_js_async_exports"
-                    } else {
-                        c"exports"
-                    }
-                    .as_ptr() as *const c_char,
-                    value.handle_mut(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetProperty failed for `{}`", name())
-            }
-            if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_ValueToObject failed for `{}`", name())
-            }
-        }
+        let object = get(
+            cx,
+            global_object.handle(),
+            if async_ {
+                c"componentize_js_async_exports"
+            } else {
+                c"exports"
+            },
+        );
+        rooted!(&in(cx) let mut object = object.to_object());
 
         if let Some(interface) = func.interface() {
-            rooted!(&in(cx) let mut value = UndefinedValue());
-            if !unsafe {
-                JS_GetProperty(
+            object.set(
+                get(
                     cx,
                     object.handle(),
-                    CString::new(interface.replace([':', '/', '-'], "_"))
-                        .unwrap()
-                        .as_bytes_with_nul()
-                        .as_ptr() as *const c_char,
-                    value.handle_mut(),
+                    &CString::new(mangle_name(interface)).unwrap(),
                 )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetProperty failed for `{}`", name())
-            }
-            if !unsafe { JS_ValueToObject(cx, value.handle(), object.handle_mut()) } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_ValueToObject failed for `{}`", name())
-            }
+                .to_object(),
+            );
         }
 
-        rooted!(&in(cx) let mut function = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                object.handle(),
-                CString::new(func.name().replace('-', "_"))
-                    .unwrap()
-                    .as_bytes_with_nul()
-                    .as_ptr() as *const c_char,
-                function.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `{}`", name())
+        let function = get(
+            cx,
+            object.handle(),
+            &CString::new(mangle_name(func.name())).unwrap(),
+        );
+        rooted!(&in(cx) let mut function = function);
+
+        if function.is_undefined() {
+            panic!("export `{}` not defined", mangle_name(func.name()));
         }
 
         let params = if async_ {
@@ -790,28 +1547,21 @@ impl MyInterpreter {
         )
         .collect::<Vec<_>>();
         rooted!(&in(cx) let params = params);
-        rooted!(&in(cx) let mut result = UndefinedValue());
-        if !unsafe {
-            JS_CallFunctionValue(
-                cx,
-                object.handle(),
-                function.handle(),
-                &HandleValueArray::from(&params),
-                result.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_CallFunctionValue failed for `{}`", name())
-        }
+        let result = self::call(
+            cx,
+            object.handle(),
+            function.handle(),
+            &HandleValueArray::from(&params),
+        );
 
         if async_ {
             poll(cx)
         } else {
             if func.result().is_some() {
-                call.push(result.get());
+                call.push(result);
             }
 
-            release_borrows(&call.traced);
+            release_borrows(cx, &call.traced);
 
             0
         }
@@ -846,11 +1596,11 @@ impl Interpreter for MyInterpreter {
         let cx = &mut context();
 
         match event0 {
-            EVENT_NONE => {}
-            EVENT_SUBTASK => match event2 {
-                STATUS_STARTING => unreachable!(),
-                STATUS_STARTED => {}
-                STATUS_RETURNED => {
+            self::EVENT_NONE => {}
+            self::EVENT_SUBTASK => match event2 {
+                self::STATUS_STARTING => unreachable!(),
+                self::STATUS_STARTED => {}
+                self::STATUS_RETURNED => {
                     unsafe {
                         waitable_join(event1, 0);
                         subtask_drop(event1);
@@ -859,7 +1609,7 @@ impl Interpreter for MyInterpreter {
                     let Pending::ImportCall {
                         index,
                         buffer,
-                        mut call,
+                        ref mut call,
                     } = CURRENT_TASK_STATE
                         .try_lock()
                         .unwrap()
@@ -875,7 +1625,7 @@ impl Interpreter for MyInterpreter {
 
                     let func = WIT.get().unwrap().import_func(index);
 
-                    unsafe { func.lift_import_async_result(&mut call, buffer) };
+                    unsafe { func.lift_import_async_result(call, buffer) };
                     assert!(call.len() < 4);
 
                     rooted!(&in(cx) let mut result = UndefinedValue());
@@ -885,35 +1635,217 @@ impl Interpreter for MyInterpreter {
                     _ = call.pop(); // skip `reject` callback
                     rooted!(&in(cx) let resolve = call.pop());
                     rooted!(&in(cx) let params = vec![result.get()]);
-                    rooted!(&in(cx) let mut result = UndefinedValue());
-                    if !unsafe {
-                        JS_CallFunctionValue(
-                            cx,
-                            Handle::<*mut JSObject>::null(),
-                            resolve.handle(),
-                            &HandleValueArray::from(&params),
-                            result.handle_mut(),
-                        )
-                    } {
-                        unsafe { PrintAndClearException(cx.raw_cx()) }
-                        panic!("JS_CallFunctionValue failed for `resolve`")
-                    }
+                    self::call(
+                        cx,
+                        Handle::<*mut JSObject>::null(),
+                        resolve.handle(),
+                        &HandleValueArray::from(&params),
+                    );
                 }
                 _ => todo!(),
             },
-            _ => todo!(),
+            self::EVENT_STREAM_WRITE => {
+                unsafe { waitable_join(event1, 0) };
+
+                let pending = &CURRENT_TASK_STATE
+                    .try_lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .pending
+                    .remove(&event1)
+                    .unwrap();
+
+                let Pending::StreamWrite { traced, .. } = pending else {
+                    unreachable!()
+                };
+
+                rooted!(&in(cx) let stream = traced.try_lock().unwrap().wrapper.get());
+                rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
+
+                let count = event2 >> 4;
+                let code = event2 & 0xF;
+
+                if code == RETURN_CODE_DROPPED {
+                    rooted!(&in(cx) let value = BooleanValue(true));
+                    set(cx, stream.handle(), c"reader_dropped", value.handle());
+                }
+
+                restore_resources(cx, traced, count);
+
+                rooted!(&in(cx) let value = UInt32Value(count));
+                resolve(cx, promise.handle(), value.handle());
+            }
+            self::EVENT_STREAM_READ => {
+                unsafe { waitable_join(event1, 0) };
+
+                let pending = &mut CURRENT_TASK_STATE
+                    .try_lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .pending
+                    .remove(&event1)
+                    .unwrap();
+
+                let Pending::StreamRead {
+                    traced,
+                    buffer,
+                    call,
+                    ..
+                } = pending
+                else {
+                    unreachable!()
+                };
+
+                rooted!(&in(cx) let stream = traced.try_lock().unwrap().wrapper.get());
+                rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
+
+                let index = get(cx, stream.handle(), c"componentize_js_type");
+                let ty = WIT
+                    .get()
+                    .unwrap()
+                    .stream(usize::try_from(index.to_int32() as u32).unwrap());
+
+                let count = usize::try_from(event2 >> 4).unwrap();
+                let code = event2 & 0xF;
+
+                if code == RETURN_CODE_DROPPED {
+                    rooted!(&in(cx) let value = BooleanValue(true));
+                    set(cx, stream.handle(), c"writer_dropped", value.handle());
+                }
+
+                assert!(traced.try_lock().unwrap().resources.is_none());
+
+                if let Some(Type::U8 | Type::S8) = ty.ty() {
+                    rooted!(&in(cx) let mut js_buffer = ptr::null_mut::<JSObject>());
+                    unsafe {
+                        ArrayBuffer::create(
+                            cx.raw_cx(),
+                            CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                            js_buffer.handle_mut(),
+                        )
+                        .unwrap()
+                    }
+                    rooted!(&in(cx) let value = ObjectValue(js_buffer.get()));
+                    resolve(cx, promise.handle(), value.handle());
+                } else {
+                    rooted!(&in(cx) let array = unsafe { NewArrayObject1(cx, count) });
+                    for offset in 0..count {
+                        unsafe { ty.lift(call, buffer.add(ty.abi_payload_size() * offset)) };
+                        rooted!(&in(cx) let value = call.pop());
+                        set_element(
+                            cx,
+                            array.handle(),
+                            offset.try_into().unwrap(),
+                            value.handle(),
+                        );
+                    }
+                    rooted!(&in(cx) let value = ObjectValue(array.get()));
+                    resolve(cx, promise.handle(), value.handle());
+                }
+            }
+            self::EVENT_FUTURE_WRITE => {
+                unsafe { waitable_join(event1, 0) };
+
+                let pending = &CURRENT_TASK_STATE
+                    .try_lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .pending
+                    .remove(&event1)
+                    .unwrap();
+
+                let Pending::FutureWrite { traced, .. } = pending else {
+                    unreachable!()
+                };
+
+                rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
+
+                let code = event2 & 0xF;
+
+                if code == RETURN_CODE_DROPPED {
+                    restore_resources(cx, traced, 0);
+                }
+
+                let result = match code {
+                    self::RETURN_CODE_COMPLETED => true,
+                    self::RETURN_CODE_DROPPED => false,
+                    self::RETURN_CODE_CANCELLED => todo!(),
+                    _ => unreachable!(),
+                };
+                rooted!(&in(cx) let value = BooleanValue(result));
+                resolve(cx, promise.handle(), value.handle());
+            }
+            self::EVENT_FUTURE_READ => {
+                unsafe { waitable_join(event1, 0) };
+
+                let pending = &mut CURRENT_TASK_STATE
+                    .try_lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .0
+                    .pending
+                    .remove(&event1)
+                    .unwrap();
+
+                let &mut Pending::FutureRead {
+                    ref traced,
+                    buffer,
+                    ref mut call,
+                    ..
+                } = pending
+                else {
+                    unreachable!()
+                };
+
+                assert!(traced.try_lock().unwrap().resources.is_none());
+
+                rooted!(&in(cx) let future = traced.try_lock().unwrap().wrapper.get());
+                rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
+
+                let index = get(cx, future.handle(), c"componentize_js_type");
+                let ty = WIT
+                    .get()
+                    .unwrap()
+                    .future(usize::try_from(index.to_int32() as u32).unwrap());
+
+                let code = event2 & 0xF;
+                match code {
+                    self::RETURN_CODE_COMPLETED => unsafe { ty.lift(call, buffer) },
+                    self::RETURN_CODE_DROPPED => unreachable!(),
+                    self::RETURN_CODE_CANCELLED => todo!(),
+                    _ => unreachable!(),
+                }
+                rooted!(&in(cx) let value = call.pop());
+                resolve(cx, promise.handle(), value.handle());
+            }
+            self::EVENT_CANCELLED => todo!(),
+            _ => unreachable!(),
         }
 
         poll(cx)
     }
 
     fn resource_dtor(ty: wit::Resource, handle: usize) {
-        _ = (ty, handle);
-        todo!()
+        let cx = &mut context();
+        let wrapper = EXPORTED_RESOURCES.try_lock().unwrap().0.remove(handle);
+
+        rooted!(&in(cx) let wrapper = wrapper.get());
+        assert_eq!(
+            ty.index(),
+            usize::try_from(get(cx, wrapper.handle(), c"componentize_js_type").to_int32() as u32)
+                .unwrap()
+        );
     }
 }
 
-struct Traced {
+struct MyCallTraced {
     #[expect(
         clippy::vec_box,
         reason = "`Heap` values must be boxed to ensure they are not moved"
@@ -928,18 +1860,24 @@ struct MyCall<'a> {
     iter_stack: Vec<usize>,
     deferred_deallocations: Vec<(*mut u8, Layout)>,
     strings: Vec<String>,
-    traced: Arc<Mutex<Traced>>,
+    traced: Arc<Mutex<MyCallTraced>>,
 }
 
 impl MyCall<'_> {
     #[expect(clippy::arc_with_non_send_sync)]
     fn new() -> Self {
-        let traced = Arc::new(Mutex::new(Traced {
+        let traced = Arc::new(Mutex::new(MyCallTraced {
             stack: Vec::new(),
             resources: None,
             borrows: Vec::new(),
         }));
-        assert!(TRACED.try_lock().unwrap().0.insert(ArcHash(traced.clone())));
+        assert!(
+            MY_CALL_TRACED
+                .try_lock()
+                .unwrap()
+                .0
+                .insert(ArcHash(traced.clone()))
+        );
         Self {
             _phantom: PhantomData,
             iter_stack: Vec::new(),
@@ -969,30 +1907,12 @@ impl MyCall<'_> {
         self.traced.try_lock().unwrap().stack.len()
     }
 
-    fn imported_resource_to_canon(&mut self, value: Value, owned: bool) -> u32 {
-        let cx = &mut context();
+    fn imported_resource_to_canon(&mut self, cx: &mut JSContext, value: Value, owned: bool) -> u32 {
         rooted!(&in(cx) let value = value.to_object());
-        rooted!(&in(cx) let mut handle = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                value.handle(),
-                c"handle".as_ptr() as *const c_char,
-                handle.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `handle`")
-        }
-        let handle = handle.to_int32() as u32;
+        let handle = get(cx, value.handle(), c"componentize_js_handle").to_int32() as u32;
 
         if owned {
-            if !unsafe {
-                JS_DeleteProperty1(cx, value.handle(), c"handle".as_ptr() as *const c_char)
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_DeleteProperty failed for `handle`")
-            }
+            delete(cx, value.handle(), c"componentize_js_handle");
 
             if let Some(resources) = &mut self.traced.try_lock().unwrap().resources.as_mut() {
                 resources.push(EmptyResource {
@@ -1009,7 +1929,7 @@ impl MyCall<'_> {
 impl Drop for MyCall<'_> {
     fn drop(&mut self) {
         assert!(
-            TRACED
+            MY_CALL_TRACED
                 .try_lock()
                 .unwrap()
                 .0
@@ -1115,71 +2035,51 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_borrow(&mut self, ty: wit::Resource) -> u32 {
+        let cx = &mut context();
         let value = self.pop();
         if let Some(new) = ty.new() {
             // exported resource type
-            exported_resource_to_canon(ty, new, value)
+            exported_resource_to_canon(cx, ty, new, value)
         } else {
             // imported resource type
-            self.imported_resource_to_canon(value, false)
+            self.imported_resource_to_canon(cx, value, false)
         }
     }
 
     fn pop_own(&mut self, ty: wit::Resource) -> u32 {
+        let cx = &mut context();
         let value = self.pop();
         if let Some(new) = ty.new() {
             // exported resource type
-            exported_resource_to_canon(ty, new, value)
+            exported_resource_to_canon(cx, ty, new, value)
         } else {
             // imported resource type
-            self.imported_resource_to_canon(value, true)
+            self.imported_resource_to_canon(cx, value, true)
         }
     }
 
     fn pop_enum(&mut self, _ty: wit::Enum) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        rooted!(&in(cx) let mut value = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                wrapper.handle(),
-                c"discriminant".as_ptr() as *const c_char,
-                value.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `value`")
-        }
-        value.get().to_int32() as u32
+        get(cx, wrapper.handle(), c"discriminant").to_int32() as u32
     }
 
     fn pop_flags(&mut self, _ty: wit::Flags) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        rooted!(&in(cx) let mut value = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                wrapper.handle(),
-                c"value".as_ptr() as *const c_char,
-                value.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `value`")
-        }
-        value.get().to_int32() as u32
+        get(cx, wrapper.handle(), c"value").to_int32() as u32
     }
 
     fn pop_future(&mut self, _ty: wit::Future) -> u32 {
+        let cx = &mut context();
         let value = self.pop();
-        self.imported_resource_to_canon(value, true)
+        self.imported_resource_to_canon(cx, value, true)
     }
 
     fn pop_stream(&mut self, _ty: wit::Stream) -> u32 {
+        let cx = &mut context();
         let value = self.pop();
-        self.imported_resource_to_canon(value, true)
+        self.imported_resource_to_canon(cx, value, true)
     }
 
     fn pop_option(&mut self, ty: WitOption) -> u32 {
@@ -1190,19 +2090,7 @@ impl Call for MyCall<'_> {
             if let Type::Option(_) = ty.ty() {
                 let cx = &mut context();
                 rooted!(&in(cx) let wrapper = self.pop().to_object());
-                rooted!(&in(cx) let mut value = UndefinedValue());
-                if !unsafe {
-                    JS_GetProperty(
-                        cx,
-                        wrapper.handle(),
-                        c"value".as_ptr() as *const c_char,
-                        value.handle_mut(),
-                    )
-                } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_GetProperty failed for `value`")
-                }
-                self.push(value.get());
+                self.push(get(cx, wrapper.handle(), c"value"));
             } else {
                 // Leave value on the stack as-is.
             }
@@ -1213,19 +2101,7 @@ impl Call for MyCall<'_> {
     fn pop_result(&mut self, ty: WitResult) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        rooted!(&in(cx) let mut discriminant = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                wrapper.handle(),
-                c"discriminant".as_ptr() as *const c_char,
-                discriminant.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `discriminant`")
-        }
-        let discriminant = discriminant.to_int32() as u32;
+        let discriminant = get(cx, wrapper.handle(), c"discriminant").to_int32() as u32;
 
         let has_payload = match discriminant {
             0 => ty.ok().is_some(),
@@ -1234,19 +2110,7 @@ impl Call for MyCall<'_> {
         };
 
         if has_payload {
-            rooted!(&in(cx) let mut payload = UndefinedValue());
-            if !unsafe {
-                JS_GetProperty(
-                    cx,
-                    wrapper.handle(),
-                    c"value".as_ptr() as *const c_char,
-                    payload.handle_mut(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetProperty failed for `value3`")
-            }
-            self.push(payload.get());
+            self.push(get(cx, wrapper.handle(), c"value"));
         }
 
         discriminant
@@ -1255,19 +2119,7 @@ impl Call for MyCall<'_> {
     fn pop_variant(&mut self, ty: wit::Variant) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        rooted!(&in(cx) let mut discriminant = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                wrapper.handle(),
-                c"discriminant".as_ptr() as *const c_char,
-                discriminant.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `discriminant`")
-        }
-        let discriminant = discriminant.to_int32() as u32;
+        let discriminant = get(cx, wrapper.handle(), c"discriminant").to_int32() as u32;
 
         let has_payload = ty
             .cases()
@@ -1277,19 +2129,7 @@ impl Call for MyCall<'_> {
             .is_some();
 
         if has_payload {
-            rooted!(&in(cx) let mut payload = UndefinedValue());
-            if !unsafe {
-                JS_GetProperty(
-                    cx,
-                    wrapper.handle(),
-                    c"value".as_ptr() as *const c_char,
-                    payload.handle_mut(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetProperty failed for `value3`")
-            }
-            self.push(payload.get());
+            self.push(get(cx, wrapper.handle(), c"value"));
         }
 
         discriminant
@@ -1299,22 +2139,11 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let record = self.pop().to_object());
         for (name, _) in ty.fields() {
-            rooted!(&in(cx) let mut field = UndefinedValue());
-            if !unsafe {
-                JS_GetProperty(
-                    cx,
-                    record.handle(),
-                    CString::new(name.replace('-', "_"))
-                        .unwrap()
-                        .as_bytes_with_nul()
-                        .as_ptr() as *const c_char,
-                    field.handle_mut(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetProperty failed for `{name}`")
-            }
-            self.push(field.get());
+            self.push(get(
+                cx,
+                record.handle(),
+                &CString::new(mangle_name(name)).unwrap(),
+            ));
         }
     }
 
@@ -1323,19 +2152,11 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let tuple = self.pop().to_object());
         for index in 0..count {
-            rooted!(&in(cx) let mut value = UndefinedValue());
-            if !unsafe {
-                JS_GetElement(
-                    cx,
-                    tuple.handle(),
-                    u32::try_from(count - index - 1).unwrap(),
-                    value.handle_mut(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_GetElement failed for `{index}`")
-            }
-            self.push(value.get());
+            self.push(get_element(
+                cx,
+                tuple.handle(),
+                u32::try_from(count - index - 1).unwrap(),
+            ));
         }
     }
 
@@ -1358,41 +2179,21 @@ impl Call for MyCall<'_> {
         self.iter_stack.push(0);
         let cx = &mut context();
         rooted!(&in(cx) let list = self.last().to_object());
-        rooted!(&in(cx) let mut length = UndefinedValue());
         // TODO: Is there a quicker way to get the array length, e.g. using
         // `JS_GetPropertyById`?
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                list.handle(),
-                c"length".as_ptr() as *const c_char,
-                length.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `length`")
-        }
-        length.to_int32().try_into().unwrap()
+        get(cx, list.handle(), c"length")
+            .to_int32()
+            .try_into()
+            .unwrap()
     }
 
     fn pop_iter_next(&mut self, _ty: List) {
         let index = *self.iter_stack.last().unwrap();
         let cx = &mut context();
         rooted!(&in(cx) let list = self.last().to_object());
-        rooted!(&in(cx) let mut value = UndefinedValue());
-        if !unsafe {
-            JS_GetElement(
-                cx,
-                list.handle(),
-                u32::try_from(index).unwrap(),
-                value.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetElement failed for `{index}`")
-        }
+        let value = get_element(cx, list.handle(), u32::try_from(index).unwrap());
         *self.iter_stack.last_mut().unwrap() = index + 1;
-        self.push(value.get());
+        self.push(value);
     }
 
     fn pop_iter(&mut self, _ty: List) {
@@ -1483,20 +2284,12 @@ impl Call for MyCall<'_> {
         rooted!(&in(cx) let value = unsafe { JS_NewObject(cx, ptr::null_mut()) });
         for (name, _) in ty.fields() {
             rooted!(&in(cx) let field = self.pop());
-            if !unsafe {
-                JS_SetProperty(
-                    cx,
-                    value.handle(),
-                    CString::new(name.replace('-', "_"))
-                        .unwrap()
-                        .as_bytes_with_nul()
-                        .as_ptr() as *const c_char,
-                    field.handle(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_SetProperty failed")
-            }
+            set(
+                cx,
+                value.handle(),
+                &CString::new(mangle_name(name)).unwrap(),
+                field.handle(),
+            );
         }
         self.push(ObjectValue(value.get()));
     }
@@ -1523,17 +2316,7 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
         rooted!(&in(cx) let value = UInt32Value(bits));
-        if !unsafe {
-            JS_SetProperty(
-                cx,
-                wrapper.handle(),
-                c"value".as_ptr() as *const c_char,
-                value.handle(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_SetProperty failed")
-        }
+        set(cx, wrapper.handle(), c"value", value.handle());
         self.push(ObjectValue(wrapper.get()));
     }
 
@@ -1541,17 +2324,7 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
         rooted!(&in(cx) let discriminant = UInt32Value(discriminant));
-        if !unsafe {
-            JS_SetProperty(
-                cx,
-                wrapper.handle(),
-                c"discriminant".as_ptr() as *const c_char,
-                discriminant.handle(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_SetProperty failed")
-        }
+        set(cx, wrapper.handle(), c"discriminant", discriminant.handle());
         self.push(ObjectValue(wrapper.get()));
     }
 
@@ -1566,7 +2339,7 @@ impl Call for MyCall<'_> {
                 .get()
         } else {
             // imported resource type
-            let value = imported_resource_from_canon(ty.index(), handle);
+            let value = imported_resource_from_canon(&mut context(), ty.index(), handle);
 
             self.traced.try_lock().unwrap().borrows.push(Borrow {
                 value: Heap::boxed(value),
@@ -1579,40 +2352,49 @@ impl Call for MyCall<'_> {
     }
 
     fn push_own(&mut self, ty: wit::Resource, handle: u32) {
+        let cx = &mut context();
         self.push(ObjectValue(if let Some(rep) = ty.rep() {
             // exported resource type
-            let cx = &mut context();
             let rep = unsafe { rep(handle) };
             rooted!(&in(cx) let value = EXPORTED_RESOURCES.try_lock().unwrap().0.remove(rep).get());
 
-            for name in [c"componentize_js_handle", c"componentize_js_index"] {
-                if !unsafe {
-                    JS_DeleteProperty1(cx, value.handle(), name.as_ptr() as *const c_char)
-                } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_DeleteProperty failed for `{}`", name.to_str().unwrap())
-                }
+            for name in [c"componentize_js_handle", c"componentize_js_type"] {
+                delete(cx, value.handle(), name);
             }
 
             value.get()
         } else {
             // imported resource type
-            imported_resource_from_canon(ty.index(), handle)
+            imported_resource_from_canon(cx, ty.index(), handle)
         }));
     }
 
     fn push_future(&mut self, ty: wit::Future, handle: u32) {
-        self.push(ObjectValue(imported_resource_from_canon(
-            ty.index(),
-            handle,
-        )))
+        let cx = &mut context();
+        let stream = imported_resource_from_canon(cx, ty.index(), handle);
+        rooted!(&in(cx) let rx = stream);
+        for (name, func) in [
+            (c"read", future_read as JsFunction),
+            (c"drop", future_drop_readable as JsFunction),
+        ] {
+            rooted!(&in(cx) let mut func = wrap(cx, func));
+            set(cx, rx.handle(), name, func.handle());
+        }
+        self.push(ObjectValue(rx.get()))
     }
 
     fn push_stream(&mut self, ty: wit::Stream, handle: u32) {
-        self.push(ObjectValue(imported_resource_from_canon(
-            ty.index(),
-            handle,
-        )))
+        let cx = &mut context();
+        let stream = imported_resource_from_canon(cx, ty.index(), handle);
+        rooted!(&in(cx) let rx = stream);
+        for (name, func) in [
+            (c"read", stream_read as JsFunction),
+            (c"drop", stream_drop_readable as JsFunction),
+        ] {
+            rooted!(&in(cx) let mut func = wrap(cx, func));
+            set(cx, rx.handle(), name, func.handle());
+        }
+        self.push(ObjectValue(rx.get()))
     }
 
     fn push_variant(&mut self, ty: wit::Variant, discriminant: u32) {
@@ -1620,17 +2402,7 @@ impl Call for MyCall<'_> {
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
         {
             rooted!(&in(cx) let discriminant = UInt32Value(discriminant));
-            if !unsafe {
-                JS_SetProperty(
-                    cx,
-                    wrapper.handle(),
-                    c"discriminant".as_ptr() as *const c_char,
-                    discriminant.handle(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_SetProperty failed")
-            }
+            set(cx, wrapper.handle(), c"discriminant", discriminant.handle());
         }
 
         if ty
@@ -1641,17 +2413,7 @@ impl Call for MyCall<'_> {
             .is_some()
         {
             rooted!(&in(cx) let value = self.pop());
-            if !unsafe {
-                JS_SetProperty(
-                    cx,
-                    wrapper.handle(),
-                    c"value".as_ptr() as *const c_char,
-                    value.handle(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_SetProperty failed")
-            }
+            set(cx, wrapper.handle(), c"value", value.handle());
         }
 
         self.push(ObjectValue(wrapper.get()));
@@ -1663,17 +2425,7 @@ impl Call for MyCall<'_> {
                 let cx = &mut context();
                 rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
                 rooted!(&in(cx) let value = self.pop());
-                if !unsafe {
-                    JS_SetProperty(
-                        cx,
-                        wrapper.handle(),
-                        c"value".as_ptr() as *const c_char,
-                        value.handle(),
-                    )
-                } {
-                    unsafe { PrintAndClearException(cx.raw_cx()) }
-                    panic!("JS_SetProperty failed")
-                }
+                set(cx, wrapper.handle(), c"value", value.handle());
                 self.push(ObjectValue(wrapper.get()));
             } else {
                 // Leave payload on the stack as-is.
@@ -1687,30 +2439,10 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
         rooted!(&in(cx) let discriminant = UInt32Value(if is_err { 1 } else { 0}));
-        if !unsafe {
-            JS_SetProperty(
-                cx,
-                wrapper.handle(),
-                c"discriminant".as_ptr() as *const c_char,
-                discriminant.handle(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_SetProperty failed")
-        }
+        set(cx, wrapper.handle(), c"discriminant", discriminant.handle());
         if (is_err && ty.err().is_some()) || (!is_err && ty.ok().is_some()) {
             rooted!(&in(cx) let value = self.pop());
-            if !unsafe {
-                JS_SetProperty(
-                    cx,
-                    wrapper.handle(),
-                    c"value".as_ptr() as *const c_char,
-                    value.handle(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_SetProperty failed")
-            }
+            set(cx, wrapper.handle(), c"value", value.handle());
         }
         self.push(ObjectValue(wrapper.get()));
     }
@@ -1749,90 +2481,48 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let element = self.pop());
         rooted!(&in(cx) let list = self.last().to_object());
-        rooted!(&in(cx) let mut push = UndefinedValue());
-        if !unsafe {
-            JS_GetProperty(
-                cx,
-                list.handle(),
-                c"push".as_ptr() as *const c_char,
-                push.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_GetProperty failed for `push`")
-        }
-
+        rooted!(&in(cx) let mut push = get(cx, list.handle(), c"push"));
         rooted!(&in(cx) let params = vec![element.get()]);
-        rooted!(&in(cx) let mut result = UndefinedValue());
-        if !unsafe {
-            JS_CallFunctionValue(
-                cx,
-                list.handle(),
-                push.handle(),
-                &HandleValueArray::from(&params),
-                result.handle_mut(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_CallFunctionValue failed for `push`")
-        }
+        call(
+            cx,
+            list.handle(),
+            push.handle(),
+            &HandleValueArray::from(&params),
+        );
     }
 }
 
 wit_dylib_ffi::export!(MyInterpreter);
 
-fn imported_resource_from_canon(index: usize, handle: u32) -> *mut JSObject {
-    let cx = &mut context();
+fn imported_resource_from_canon(cx: &mut JSContext, index: usize, handle: u32) -> *mut JSObject {
     rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
-
     rooted!(&in(cx) let handle = UInt32Value(handle));
-    if !unsafe {
-        JS_SetProperty(
-            cx,
-            wrapper.handle(),
-            c"handle".as_ptr() as *const c_char,
-            handle.handle(),
-        )
-    } {
-        unsafe { PrintAndClearException(cx.raw_cx()) }
-        panic!("JS_SetProperty failed")
-    }
+    set(
+        cx,
+        wrapper.handle(),
+        c"componentize_js_handle",
+        handle.handle(),
+    );
 
     rooted!(&in(cx) let index = UInt32Value(index.try_into().unwrap()));
-    if !unsafe {
-        JS_SetProperty(
-            cx,
-            wrapper.handle(),
-            c"componentize_js_type".as_ptr() as *const c_char,
-            index.handle(),
-        )
-    } {
-        unsafe { PrintAndClearException(cx.raw_cx()) }
-        panic!("JS_SetProperty failed")
-    }
+    set(
+        cx,
+        wrapper.handle(),
+        c"componentize_js_type",
+        index.handle(),
+    );
 
     wrapper.get()
 }
 
 fn exported_resource_to_canon(
+    cx: &mut JSContext,
     ty: wit::Resource,
     new: unsafe extern "C" fn(usize) -> u32,
     value: Value,
 ) -> u32 {
-    let cx = &mut context();
     rooted!(&in(cx) let value = value.to_object());
-    rooted!(&in(cx) let mut handle = UndefinedValue());
-    if !unsafe {
-        JS_GetProperty(
-            cx,
-            value.handle(),
-            c"componentize_js_handle".as_ptr() as *const c_char,
-            handle.handle_mut(),
-        )
-    } {
-        unsafe { PrintAndClearException(cx.raw_cx()) }
-        panic!("JS_GetProperty failed for `componentize_js_handle`")
-    }
+    rooted!(&in(cx) let mut handle = get(cx, value.handle(), c"componentize_js_handle"));
 
     if handle.is_int32() {
         handle.to_int32() as u32
@@ -1842,41 +2532,28 @@ fn exported_resource_to_canon(
             .unwrap()
             .0
             .insert(Heap::boxed(value.get()));
-        let handle = unsafe { new(rep as usize) };
+
+        let handle = unsafe { new(rep) };
+
         {
             rooted!(&in(cx) let handle = UInt32Value(handle));
-            if !unsafe {
-                JS_SetProperty(
-                    cx,
-                    value.handle(),
-                    c"componentize_js_handle".as_ptr() as *const c_char,
-                    handle.handle(),
-                )
-            } {
-                unsafe { PrintAndClearException(cx.raw_cx()) }
-                panic!("JS_SetProperty failed")
-            }
+            set(
+                cx,
+                value.handle(),
+                c"componentize_js_handle",
+                handle.handle(),
+            );
         }
 
         rooted!(&in(cx) let index = UInt32Value(ty.index().try_into().unwrap()));
-        if !unsafe {
-            JS_SetProperty(
-                cx,
-                value.handle(),
-                c"componentize_js_type".as_ptr() as *const c_char,
-                index.handle(),
-            )
-        } {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            panic!("JS_SetProperty failed")
-        }
+        set(cx, value.handle(), c"componentize_js_type", index.handle());
 
         handle
     }
 }
 
 unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
-    for traced in TRACED.try_lock().unwrap().0.iter() {
+    for traced in MY_CALL_TRACED.try_lock().unwrap().0.iter() {
         let mut traced = traced.0.try_lock().unwrap();
         for value in traced.stack.iter_mut() {
             if value.get().is_markable() {
@@ -1911,6 +2588,40 @@ unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
         }
     }
 
+    for traced in TRANSMIT_TRACED.try_lock().unwrap().0.iter() {
+        let mut traced = traced.0.try_lock().unwrap();
+
+        unsafe {
+            CallObjectTracer(
+                tracer,
+                traced.wrapper.ptr.get() as *mut _,
+                GCTraceKindToAscii(TraceKind::Object),
+            )
+        }
+
+        unsafe {
+            CallObjectTracer(
+                tracer,
+                traced.promise.ptr.get() as *mut _,
+                GCTraceKindToAscii(TraceKind::Object),
+            )
+        }
+
+        if let Some(resources) = traced.resources.as_mut() {
+            for resources in resources.iter_mut() {
+                for EmptyResource { value, .. } in resources.iter_mut() {
+                    unsafe {
+                        CallObjectTracer(
+                            tracer,
+                            value.ptr.get() as *mut _,
+                            GCTraceKindToAscii(TraceKind::Object),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     for value in EXPORTED_RESOURCES.try_lock().unwrap().0.iter() {
         unsafe {
             CallObjectTracer(
@@ -1919,6 +2630,100 @@ unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
                 GCTraceKindToAscii(TraceKind::Object),
             )
         }
+    }
+}
+
+fn mangle_name(name: &str) -> String {
+    name.replace([':', '/', '-', '[', ']', '.'], "_")
+}
+
+fn mangle_ty(ty: Type) -> String {
+    // TODO: Ensure the returned name is always distinct for distinct types
+    // (e.g. by incorporating interface version numbers and/or additional
+    // mangling as needed).
+
+    let full_name = |interface, name| {
+        let interface = if let Some(name) = interface {
+            let name = mangle_name(name);
+            format!("{name}_")
+        } else {
+            String::new()
+        };
+        let name = mangle_name(name);
+        format!("{interface}{name}")
+    };
+
+    match ty {
+        Type::Bool => "bool".into(),
+        Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
+        Type::U32 => "u32".into(),
+        Type::U64 => "u64".into(),
+        Type::S8 => "s8".into(),
+        Type::S16 => "s16".into(),
+        Type::S32 => "s32".into(),
+        Type::S64 => "s64".into(),
+        Type::ErrorContext => "error_context".into(),
+        Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
+        Type::Char => "char".into(),
+        Type::String => "string".into(),
+        Type::Record(ty) => full_name(ty.interface(), ty.name()),
+        Type::Own(ty) | Type::Borrow(ty) => full_name(ty.interface(), ty.name()),
+        Type::Flags(ty) => full_name(ty.interface(), ty.name()),
+        Type::Enum(ty) => full_name(ty.interface(), ty.name()),
+        Type::Variant(ty) => full_name(ty.interface(), ty.name()),
+        Type::Tuple(ty) => {
+            let count = ty.types().len();
+            let types = ty
+                .types()
+                .map(|ty| {
+                    let name = mangle_ty(ty);
+                    format!("_{name}")
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            format!("tuple{count}{types}")
+        }
+        Type::Option(ty) => {
+            let name = mangle_ty(ty.ty());
+            format!("option_{name}")
+        }
+        Type::Result(ty) => {
+            let ok = if let Some(ty) = ty.ok() {
+                mangle_ty(ty)
+            } else {
+                "unit".into()
+            };
+            let err = if let Some(ty) = ty.err() {
+                mangle_ty(ty)
+            } else {
+                "unit".into()
+            };
+            format!("result_{ok}_{err}")
+        }
+        Type::List(ty) => {
+            let name = mangle_ty(ty.ty());
+            format!("list_{name}")
+        }
+        Type::FixedSizeList(_) => todo!(),
+        Type::Future(ty) => {
+            let ty = if let Some(ty) = ty.ty() {
+                mangle_ty(ty)
+            } else {
+                "unit".into()
+            };
+            format!("future_{ty}")
+        }
+        Type::Stream(ty) => {
+            let ty = if let Some(ty) = ty.ty() {
+                mangle_ty(ty)
+            } else {
+                "unit".into()
+            };
+            format!("stream_{ty}")
+        }
+        Type::Alias(ty) => mangle_ty(ty.ty()),
     }
 }
 

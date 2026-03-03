@@ -1,3 +1,42 @@
+async function pipe_bytes(rx, tx) {
+    while (!(rx.writer_dropped || tx.reader_dropped)) {
+        await tx.write_all(await rx.read(1024))
+    }
+    tx.drop()
+}
+
+async function pipe_strings(rx, tx) {
+    await tx.write(await rx.read())
+}
+
+async function pipe_things(rx, tx) {
+    // Read the things one at a time, forcing the host to re-take ownership of
+    // any unwritten items between writes.
+    let things = []
+    while (!rx.writer_dropped) {
+        things.push(...await rx.read(1))
+    }
+
+    // Write the things all at once.  The host will read them only one at a time,
+    // forcing us to re-take ownership of any unwritten items between writes.
+    await tx.write_all(things)
+    tx.drop()
+}
+
+async function write_thing(thing, tx1, tx2) {
+    // The host will drop the first reader without reading, which should give us
+    // back ownership of `thing`.
+    let wrote = await tx1.write(thing)
+    if (wrote) {
+        throw Error()
+    }
+    // The host will read from the second reader, though.
+    wrote = await tx2.write(thing)
+    if (!wrote) {
+        throw Error()
+    }
+}
+
 var exports = {
     componentize_js_tests_simple_export: {
         foo: function(v) {
@@ -140,4 +179,51 @@ var exports = {
             return imports.componentize_js_tests_echoes.echo_future(v)
         }
     },
+    componentize_js_tests_streams_and_futures: {
+        echo_stream_u8: function(stream) {
+            let [tx, rx] = componentize_js_types.u8_stream()
+            pipe_bytes(stream, tx)
+            return Promise.resolve(rx)
+        },
+        echo_future_string: function(future) {
+            let [tx, rx] = componentize_js_types.string_future()
+            pipe_strings(future, tx)
+            return Promise.resolve(rx)
+        },
+        short_reads: function(stream) {
+            let [tx, rx] = componentize_js_types.componentize_js_tests_streams_and_futures_thing_stream()
+            pipe_things(stream, tx)
+            return Promise.resolve(rx)
+        },
+        short_reads_host: function(stream) {
+            let [tx, rx] = componentize_js_types.componentize_js_tests_host_thing_interface_host_thing_stream()
+            pipe_things(stream, tx)
+            return Promise.resolve(rx)            
+        },
+        dropped_future_reader: function(value) {
+            let [tx1, rx1] = componentize_js_types.componentize_js_tests_streams_and_futures_thing_future()
+            let [tx2, rx2] = componentize_js_types.componentize_js_tests_streams_and_futures_thing_future()
+            write_thing({ value }, tx1, tx2)
+            return Promise.resolve([rx1, rx2])
+        },
+        dropped_future_reader_host: function(value) {
+            let [tx1, rx1] = componentize_js_types.componentize_js_tests_host_thing_interface_host_thing_future()
+            let [tx2, rx2] = componentize_js_types.componentize_js_tests_host_thing_interface_host_thing_future()
+            write_thing(
+                imports.componentize_js_tests_host_thing_interface._constructor_host_thing(value),
+                tx1,
+                tx2
+            )
+            return Promise.resolve([rx1, rx2])
+        },
+        _constructor_thing: function(value) {
+            return { value }
+        },
+        _method_thing_get: async function(thing, delay) {
+            if (delay) {
+                await imports.delay()
+            }
+            return thing.value
+        }
+    }
 }

@@ -90,6 +90,29 @@ interface echoes {
   echo-future: func(v: future<u8>) -> future<u8>;
 }
 
+interface host-thing-interface {
+  resource host-thing {
+    constructor(s: string);
+    get: async func() -> string;
+  }
+}
+
+interface streams-and-futures {
+  use host-thing-interface.{host-thing};
+
+  resource thing {
+    constructor(s: string);
+    get: async func(delay: bool) -> string;
+  }
+
+  echo-stream-u8: async func(s: stream<u8>) -> stream<u8>;
+  echo-future-string: async func(f: future<string>) -> future<string>;
+  short-reads: async func(s: stream<thing>) -> stream<thing>;
+  short-reads-host: async func(s: stream<host-thing>) -> stream<host-thing>;
+  dropped-future-reader: async func(value: string) -> tuple<future<thing>, future<thing>>;
+  dropped-future-reader-host: async func(value: string) -> tuple<future<host-thing>, future<host-thing>>;
+}
+
 world tests {
   export simple-export;
   export simple-async-export;
@@ -99,4 +122,7 @@ world tests {
   import simple-async-import-and-export;
   import echoes;
   export echoes;
+  export streams-and-futures;
+
+  import delay: async func();
 }
