@@ -300,14 +300,14 @@ dependencies = [
  "proptest",
  "rand 0.10.0",
  "tokio",
- "wasm-encoder 0.244.0",
- "wasmparser 0.244.0",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wizer",
- "wit-component",
+ "wit-component 0.245.1",
  "wit-dylib",
- "wit-parser 0.244.0",
+ "wit-parser 0.245.1",
  "zstd",
 ]
 
@@ -704,6 +704,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,7 +878,7 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "foldhash",
+ "foldhash 0.1.5",
  "serde",
 ]
 
@@ -881,6 +887,11 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "foldhash 0.2.0",
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "heck"
@@ -2313,6 +2324,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-encoder"
+version = "0.245.1"
+source = "git+https://github.com/dicej/wasm-tools?rev=bc2d0ff0#bc2d0ff0ceac492aaaafdd3308639930f54f89af"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.245.1",
+]
+
+[[package]]
 name = "wasm-metadata"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2322,6 +2342,17 @@ dependencies = [
  "indexmap",
  "wasm-encoder 0.244.0",
  "wasmparser 0.244.0",
+]
+
+[[package]]
+name = "wasm-metadata"
+version = "0.245.1"
+source = "git+https://github.com/dicej/wasm-tools?rev=bc2d0ff0#bc2d0ff0ceac492aaaafdd3308639930f54f89af"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]
@@ -2345,6 +2376,17 @@ checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
 dependencies = [
  "bitflags",
  "hashbrown 0.15.5",
+ "indexmap",
+ "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.245.1"
+source = "git+https://github.com/dicej/wasm-tools?rev=bc2d0ff0#bc2d0ff0ceac492aaaafdd3308639930f54f89af"
+dependencies = [
+ "bitflags",
+ "hashbrown 0.16.1",
  "indexmap",
  "semver",
  "serde",
@@ -3061,9 +3103,9 @@ dependencies = [
  "indexmap",
  "prettyplease",
  "syn",
- "wasm-metadata",
+ "wasm-metadata 0.244.0",
  "wit-bindgen-core 0.51.0",
- "wit-component",
+ "wit-component 0.244.0",
 ]
 
 [[package]]
@@ -3077,9 +3119,9 @@ dependencies = [
  "indexmap",
  "prettyplease",
  "syn",
- "wasm-metadata",
+ "wasm-metadata 0.244.0",
  "wit-bindgen-core 0.52.0",
- "wit-component",
+ "wit-component 0.244.0",
 ]
 
 [[package]]
@@ -3126,21 +3168,38 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "wasm-encoder 0.244.0",
- "wasm-metadata",
+ "wasm-metadata 0.244.0",
  "wasmparser 0.244.0",
  "wit-parser 0.244.0",
 ]
 
 [[package]]
+name = "wit-component"
+version = "0.245.1"
+source = "git+https://github.com/dicej/wasm-tools?rev=bc2d0ff0#bc2d0ff0ceac492aaaafdd3308639930f54f89af"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "indexmap",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder 0.245.1",
+ "wasm-metadata 0.245.1",
+ "wasmparser 0.245.1",
+ "wit-parser 0.245.1",
+]
+
+[[package]]
 name = "wit-dylib"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3ed23ad7d72a88d566eaaae4d2b6bc2c3b86a6af92d0b0d6a5511ca6e9b6c9"
+version = "0.245.1"
+source = "git+https://github.com/dicej/wasm-tools?rev=bc2d0ff0#bc2d0ff0ceac492aaaafdd3308639930f54f89af"
 dependencies = [
  "anyhow",
  "indexmap",
- "wasm-encoder 0.244.0",
- "wit-parser 0.244.0",
+ "wasm-encoder 0.245.1",
+ "wit-parser 0.245.1",
 ]
 
 [[package]]
@@ -3182,6 +3241,24 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.244.0",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.245.1"
+source = "git+https://github.com/dicej/wasm-tools?rev=bc2d0ff0#bc2d0ff0ceac492aaaafdd3308639930f54f89af"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.16.1",
+ "id-arena",
+ "indexmap",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]

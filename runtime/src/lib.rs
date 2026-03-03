@@ -20,8 +20,8 @@ use {
             JSContext as RawJSContext, JSObject, JSTracer, OnNewGlobalHookOption, Value,
         },
         jsval::{
-            BigIntValue, BooleanValue, DoubleValue, Int32Value, ObjectValue, StringValue,
-            UInt32Value, UndefinedValue,
+            BigIntValue, BooleanValue, DoubleValue, Int32Value, NullValue, ObjectValue,
+            StringValue, UInt32Value, UndefinedValue,
         },
         rooted,
         rust::{
@@ -29,8 +29,9 @@ use {
             wrappers2::{
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CurrentGlobalOrNull, Evaluate,
                 JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_GetElement, JS_GetProperty,
-                JS_InitDestroyPrincipalsCallback, JS_NewFunction, JS_NewGlobalObject,
-                JS_NewStringCopyUTF8N, JS_SetProperty, JS_ValueToObject, NewArrayObject1, RunJobs,
+                JS_InitDestroyPrincipalsCallback, JS_NewFunction, JS_NewGlobalObject, JS_NewObject,
+                JS_NewStringCopyUTF8N, JS_SetProperty, JS_ValueToObject, NewArrayObject,
+                NewArrayObject1, RunJobs,
             },
         },
         typedarray::{ArrayBuffer, CreateWith},
@@ -274,7 +275,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let mut call = MyCall::new();
     for index in 0..length {
         rooted!(&in(cx) let mut value = UndefinedValue());
-        if !unsafe { JS_GetElement(cx, params.handle(), index, value.handle_mut()) } {
+        if !unsafe { JS_GetElement(cx, params.handle(), length - index - 1, value.handle_mut()) } {
             unsafe { PrintAndClearException(cx.raw_cx()) }
             panic!("JS_GetElement failed for `{index}`")
         }
@@ -831,8 +832,12 @@ impl MyCall<'_> {
         self.stack.try_lock().unwrap().pop().unwrap().get()
     }
 
-    fn last(&mut self) -> Value {
+    fn last(&self) -> Value {
         self.stack.try_lock().unwrap().last().unwrap().get()
+    }
+
+    fn len(&self) -> usize {
+        self.stack.try_lock().unwrap().len()
     }
 }
 
@@ -970,8 +975,31 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_option(&mut self, ty: WitOption) -> u32 {
-        _ = ty;
-        todo!()
+        if self.last().is_null() {
+            self.pop();
+            0
+        } else {
+            if let Type::Option(_) = ty.ty() {
+                let cx = &mut context();
+                rooted!(&in(cx) let wrapper = self.pop().to_object());
+                rooted!(&in(cx) let mut value = UndefinedValue());
+                if !unsafe {
+                    JS_GetProperty(
+                        cx,
+                        wrapper.handle(),
+                        c"value".as_ptr() as *const c_char,
+                        value.handle_mut(),
+                    )
+                } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_GetProperty failed for `value`")
+                }
+                self.push(value.get());
+            } else {
+                // Leave value on the stack as-is.
+            }
+            1
+        }
     }
 
     fn pop_result(&mut self, ty: WitResult) -> u32 {
@@ -990,8 +1018,24 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_tuple(&mut self, ty: wit::Tuple) {
-        _ = ty;
-        todo!()
+        let count = ty.types().len();
+        let cx = &mut context();
+        rooted!(&in(cx) let tuple = self.pop().to_object());
+        for index in 0..count {
+            rooted!(&in(cx) let mut value = UndefinedValue());
+            if !unsafe {
+                JS_GetElement(
+                    cx,
+                    tuple.handle(),
+                    u32::try_from(count - index - 1).unwrap(),
+                    value.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("JS_GetElement failed for `{index}`")
+            }
+            self.push(value.get());
+        }
     }
 
     unsafe fn maybe_pop_list(&mut self, ty: List) -> Option<(*const u8, usize)> {
@@ -1129,8 +1173,22 @@ impl Call for MyCall<'_> {
     }
 
     fn push_tuple(&mut self, ty: wit::Tuple) {
-        _ = ty;
-        todo!()
+        let count = ty.types().len();
+
+        let start = self.len().checked_sub(count).unwrap();
+        let elements = self
+            .stack
+            .try_lock()
+            .unwrap()
+            .drain(start..)
+            .map(|v| v.get())
+            .collect::<Vec<_>>();
+
+        let cx = &mut context();
+        rooted!(&in(cx) let elements = elements);
+        self.push(ObjectValue(unsafe {
+            NewArrayObject(cx, &HandleValueArray::from(&elements))
+        }));
     }
 
     fn push_flags(&mut self, ty: wit::Flags, bits: u32) {
@@ -1169,8 +1227,29 @@ impl Call for MyCall<'_> {
     }
 
     fn push_option(&mut self, ty: WitOption, is_some: bool) {
-        _ = (ty, is_some);
-        todo!()
+        if is_some {
+            if let Type::Option(_) = ty.ty() {
+                let cx = &mut context();
+                rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+                rooted!(&in(cx) let value = self.pop());
+                if !unsafe {
+                    JS_SetProperty(
+                        cx,
+                        wrapper.handle(),
+                        c"value".as_ptr() as *const c_char,
+                        value.handle(),
+                    )
+                } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_SetProperty failed")
+                }
+                self.push(ObjectValue(wrapper.get()));
+            } else {
+                // Leave payload on the stack as-is.
+            }
+        } else {
+            self.push(NullValue());
+        }
     }
 
     fn push_result(&mut self, ty: WitResult, is_err: bool) {

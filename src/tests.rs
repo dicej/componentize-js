@@ -637,3 +637,334 @@ fn echo_lists_u8() -> anyhow::Result<()> {
         },
     )
 }
+
+#[test]
+fn echo_lists_list_u8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(
+            proptest::collection::vec(proptest::num::u8::ANY, 0..MAX_SIZE / 2),
+            0..MAX_SIZE,
+        ),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_list_u8(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_list_list_u8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(
+            proptest::collection::vec(
+                proptest::collection::vec(proptest::num::u8::ANY, 0..MAX_SIZE / 4),
+                0..MAX_SIZE / 2,
+            ),
+            0..MAX_SIZE,
+        ),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_list_list_u8(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_options_u8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::option::of(proptest::num::u8::ANY),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_option_u8(&mut store, value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_options_option_u8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::option::of(proptest::option::of(proptest::num::u8::ANY)),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_option_option_u8(&mut store, value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_s8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::i8::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_s8(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_u16() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::u16::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_u16(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_s16() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::i16::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_s16(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_u32() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::u32::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_u32(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_s32() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::i32::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_s32(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_u64() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::u64::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_u64(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_s64() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::i64::ANY, 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_s64(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_char() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::char::any(), 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_char(&mut store, &value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_f32() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::f32::ANY.prop_map(MyF32), 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_f32(&mut store, &value.iter().map(|v| v.0).collect::<Vec<_>>())
+                    .await?
+                    .into_iter()
+                    .map(MyF32)
+                    .collect::<Vec<_>>()
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_lists_f64() -> anyhow::Result<()> {
+    proptest(
+        &proptest::collection::vec(proptest::num::f64::ANY.prop_map(MyF64), 0..MAX_SIZE),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_list_f64(&mut store, &value.iter().map(|v| v.0).collect::<Vec<_>>())
+                    .await?
+                    .into_iter()
+                    .map(MyF64)
+                    .collect::<Vec<_>>()
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_many() -> anyhow::Result<()> {
+    proptest(
+        &(
+            (
+                proptest::bool::ANY,
+                proptest::num::u8::ANY,
+                proptest::num::u16::ANY,
+                proptest::num::u32::ANY,
+                proptest::num::u64::ANY,
+                proptest::num::i8::ANY,
+                proptest::num::i16::ANY,
+                proptest::num::i32::ANY,
+            ),
+            (
+                proptest::num::i64::ANY,
+                proptest::num::f32::ANY.prop_map(MyF32),
+                proptest::num::f64::ANY.prop_map(MyF64),
+                proptest::char::any(),
+                proptest::string::string_regex(".*")?,
+                proptest::collection::vec(proptest::bool::ANY, 0..MAX_SIZE),
+                proptest::collection::vec(proptest::num::u8::ANY, 0..MAX_SIZE),
+                proptest::collection::vec(proptest::num::u16::ANY, 0..MAX_SIZE),
+            ),
+        ),
+        async |((v1, v2, v3, v4, v5, v6, v7, v8), (v9, v10, v11, v12, v13, v14, v15, v16))| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            let (r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16) = instance
+                .componentize_js_tests_echoes()
+                .call_echo_many(
+                    &mut store, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10.0, v11.0, v12, &v13, &v14,
+                    &v15, &v16,
+                )
+                .await?;
+            assert_eq!(
+                (
+                    (v1, v2, v3, v4, v5, v6, v7, v8),
+                    (v9, v10, v11, v12, v13, v14, v15, v16)
+                ),
+                (
+                    (r1, r2, r3, r4, r5, r6, r7, r8),
+                    (r9, MyF32(r10), MyF64(r11), r12, r13, r14, r15, r16)
+                ),
+            );
+            Ok(())
+        },
+    )
+}

@@ -7,16 +7,17 @@ edition = "2024"
 anyhow = "1.0.100"
 bytes = "1.11.1"
 tokio = { version = "1.49.0", features = ["macros", "rt", "rt-multi-thread", "fs"] }
-wasm-encoder = "0.244.0"
 # TODO: switch to upstream release once
 # https://github.com/bytecodealliance/wasmtime/pull/12540 is merged and
 # released:
 wasmtime = { git = "https://github.com/dicej/wasmtime", rev = "4856b557" }
 wasmtime-wasi = { git = "https://github.com/dicej/wasmtime", rev = "4856b557" }
 wasmtime-wizer = { git = "https://github.com/dicej/wasmtime", rev = "4856b557", features = ["component-model", "wasmtime"] }
-wit-component = "0.244.0"
-wit-dylib = "0.244.0"
-wit-parser = "0.244.0"
+# TODO: open a PR and switch back to upstream:
+wasm-encoder = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
+wit-component = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
+wit-dylib = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
+wit-parser = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
 zstd = "0.13.3"
 
 [workspace]
@@ -24,8 +25,9 @@ members = ["runtime"]
 
 [build-dependencies]
 anyhow = "1.0.100"
-wasm-encoder = "0.244.0"
-wasmparser = "0.244.0"
+# TODO: open a PR and switch back to upstream:
+wasm-encoder = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
+wasmparser = { git = "https://github.com/dicej/wasm-tools", rev = "bc2d0ff0" }
 zstd = "0.13.3"
 
 [dev-dependencies]

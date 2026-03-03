@@ -67,6 +67,53 @@ var exports = {
         },
         echo_list_u8: function(v) {
             return imports.componentize_js_tests_echoes.echo_list_u8(v)
+        },
+        echo_list_list_u8: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_list_u8(v)
+        },
+        echo_list_list_list_u8: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_list_list_u8(v)
+        },
+        echo_option_u8: function(v) {
+            return imports.componentize_js_tests_echoes.echo_option_u8(v)
+        },
+        echo_option_option_u8: function(v) {
+            return imports.componentize_js_tests_echoes.echo_option_option_u8(v)
+        },
+        echo_list_s8: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_s8(v)
+        },
+        echo_list_u16: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_u16(v)
+        },
+        echo_list_s16: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_s16(v)
+        },
+        echo_list_u32: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_u32(v)
+        },
+        echo_list_s32: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_s32(v)
+        },
+        echo_list_u64: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_u64(v)
+        },
+        echo_list_s64: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_s64(v)
+        },
+        echo_list_char: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_char(v)
+        },
+        echo_list_f32: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_f32(v)
+        },
+        echo_list_f64: function(v) {
+            return imports.componentize_js_tests_echoes.echo_list_f64(v)
+        },
+        echo_many: function(v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16) {
+            return imports.componentize_js_tests_echoes.echo_many(
+                v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16
+            )
         }
     },
 }
