@@ -57,9 +57,10 @@ if necessary.
 ```shell
 curl -LO https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-30/wasi-sdk-30.0-arm64-linux.tar.gz
 tar xf wasi-sdk-30.0-arm64-linux.tar.gz
-sudo mv wasi-sdk-30.0-arm64-linux /opt/
-export WASI_SDK_PATH=/opt/wasi-sdk-30.0-arm64-linux
+export WASI_SDK_PATH=$(pwd)/wasi-sdk-30.0-arm64-linux
 ```
+
+> Note: on Ubuntu 24.04, you may need to `apt install libclang-20-dev` as well.
 
 Finally, build and run the tests (CLI interface coming soon!):
 
