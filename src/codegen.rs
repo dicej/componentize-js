@@ -5,8 +5,8 @@ use {
 
 pub fn generate(metadata: &Metadata) -> String {
     // First, generate JS code which will add an `imports` property to the
-    // global object containing any and all imported functions, each of
-    // which will forward their parameters to `call_import`.
+    // global object containing any and all imported functions, each of which
+    // will forward their parameters to `call_import`.
     let mut imports = BTreeMap::<_, Vec<_>>::new();
     for (index, func) in metadata.import_funcs.iter().enumerate() {
         imports
@@ -49,18 +49,18 @@ pub fn generate(metadata: &Metadata) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
-    // Next, generate JS code which will add a
-    // `componentize_js_async_exports` property to the global object which
-    // will wrap any and all async exports defined in the script so that
-    // they call back into Rust when the promises resolve.
+    // Next, generate JS code which will add a `componentize_js_async_exports`
+    // property to the global object which will wrap any and all async exports
+    // defined in the script so that they call back into Rust when the promises
+    // resolve.
     let mut async_exports = BTreeMap::<_, Vec<_>>::new();
     for (index, func) in metadata.export_funcs.iter().enumerate() {
         // TODO: As of this writing `wit-dylib`, won't tell us which functions
         // are async, so here we conservatively generate async wrappers for all
         // of them; the wrappers for the sync functions won't actually be used.
         // We _could_ consult the original `Resolve` for that information, but
-        // it would probably be easier to modify `wit-dylib` to keep track of
-        // it so it's available in `Metadata`.
+        // it would probably be easier to modify `wit-dylib` to keep track of it
+        // so it's available in `Metadata`.
         async_exports
             .entry(&func.interface)
             .or_default()
@@ -102,9 +102,9 @@ pub fn generate(metadata: &Metadata) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
-    // Next, generate JS code which will add a
-    // `componentize_js_types` property to the global object which
-    // will provide constructors for any and all future and stream types.
+    // Next, generate JS code which will add a `types` property to the global
+    // object which will provide constructors for any and all future and stream
+    // types.
     let types = metadata
         .streams
         .iter()
@@ -144,18 +144,18 @@ pub fn generate(metadata: &Metadata) -> String {
   return total
 }";
 
-    // For some reason I have not yet determined, we need an `await` to
-    // appear somewhere in the script to force `Promise` to be in scope.
+    // For some reason I have not yet determined, we need an `await` to appear
+    // somewhere in the script to force `Promise` to be in scope.
     //
-    // TODO: Figure out the right way to add `Promise` to the global scope without
-    // this hack:
+    // TODO: Figure out the right way to add `Promise` to the global scope
+    // without this hack:
     let promise_hack = "(async function(){await Promise.resolve(42)})()";
 
     // Finally, combine everything together:
     format!(
         "var imports = {{{imports}}}\n\
          var componentize_js_async_exports = {{{async_exports}}}\n\
-         var componentize_js_types = {{{types}}}\n\
+         var types = {{{types}}}\n\
          var componentize_js_write_all = {write_all}\n\
          var componentize_js_promise_hack = {promise_hack}"
     )

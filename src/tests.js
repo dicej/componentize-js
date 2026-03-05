@@ -181,34 +181,34 @@ var exports = {
     },
     componentize_js_tests_streams_and_futures: {
         echo_stream_u8: function(stream) {
-            let [tx, rx] = componentize_js_types.u8_stream()
+            let [tx, rx] = types.u8_stream()
             pipe_bytes(stream, tx)
             return Promise.resolve(rx)
         },
         echo_future_string: function(future) {
-            let [tx, rx] = componentize_js_types.string_future()
+            let [tx, rx] = types.string_future()
             pipe_strings(future, tx)
             return Promise.resolve(rx)
         },
         short_reads: function(stream) {
-            let [tx, rx] = componentize_js_types.componentize_js_tests_streams_and_futures_thing_stream()
+            let [tx, rx] = types.componentize_js_tests_streams_and_futures_thing_stream()
             pipe_things(stream, tx)
             return Promise.resolve(rx)
         },
         short_reads_host: function(stream) {
-            let [tx, rx] = componentize_js_types.componentize_js_tests_host_thing_interface_host_thing_stream()
+            let [tx, rx] = types.componentize_js_tests_host_thing_interface_host_thing_stream()
             pipe_things(stream, tx)
             return Promise.resolve(rx)            
         },
         dropped_future_reader: function(value) {
-            let [tx1, rx1] = componentize_js_types.componentize_js_tests_streams_and_futures_thing_future()
-            let [tx2, rx2] = componentize_js_types.componentize_js_tests_streams_and_futures_thing_future()
+            let [tx1, rx1] = types.componentize_js_tests_streams_and_futures_thing_future()
+            let [tx2, rx2] = types.componentize_js_tests_streams_and_futures_thing_future()
             write_thing({ value }, tx1, tx2)
             return Promise.resolve([rx1, rx2])
         },
         dropped_future_reader_host: function(value) {
-            let [tx1, rx1] = componentize_js_types.componentize_js_tests_host_thing_interface_host_thing_future()
-            let [tx2, rx2] = componentize_js_types.componentize_js_tests_host_thing_interface_host_thing_future()
+            let [tx1, rx1] = types.componentize_js_tests_host_thing_interface_host_thing_future()
+            let [tx2, rx2] = types.componentize_js_tests_host_thing_interface_host_thing_future()
             write_thing(
                 imports.componentize_js_tests_host_thing_interface._constructor_host_thing(value),
                 tx1,
