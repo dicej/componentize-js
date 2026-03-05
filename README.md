@@ -27,19 +27,17 @@ and possibly at a higher level of abstraction outside of this crate.
 - [x] support streams and futures
 - [x] support imported and exported resources
 - [x] support arbitrary WIT types
+- [x] add a license (Apache 2 + LLVM exception)
 - [ ] run linting and tests in CI
-- [ ] add a license (Apache 2 + LLVM exception)
 - [ ] add a CLI interface
 - [ ] move JS code generation out of guest code to minimize snapshot bloat
-- [ ] make codegen for enums, variants, and flags more idiomatic and/or easier to use
+- [ ] make codegen match existing `ComponentizeJS` output
+- [ ] generate (and validate in CI) TypeScript bindings (can probably use existing `ComponentizeJS` code)
 - [ ] resource/stream/future disposal using [`Symbol.dispose`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/dispose)
-- [ ] represent interfaces as EcmaScript modules
-- [ ] represent resources as classes
 - [ ] make streams (and futures?) more idiomatic (e.g. `ReadableStream` and `WritableStream`)
 - [ ] integrate with (parts of) Servo and StarlingMonkey for WinterCG support
 - [ ] add examples and lint and test them in CI (cf. the [`componentize-py` examples](https://github.com/bytecodealliance/componentize-py/tree/main/examples))
-- [ ] generate (and validate in CI) TypeScript bindings
-- [ ] investigate options for zero-copy `stream<u8>` reads and writes
+- [ ] investigate options (e.g. GC pinning?) for zero-copy `stream<u8>` reads and writes
 
 ## Building and Running
 
