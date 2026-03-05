@@ -41,12 +41,20 @@ and possibly at a higher level of abstraction outside of this crate.
 
 ## Building and Running
 
-First, install [Rust](https://rustup.rs/) and the `wasm32-wasip1` target if you
-don't already have them:
+First, install [Rust](https://rustup.rs/) stable *and* nightly, including the
+`wasm32-wasip1` target if you don't already have them.
+
+> Note that we currently use the `-Z build-std` Cargo option to build the
+> `componentize-py` runtime with position-independent code (which is not the
+> default for `wasm32-wasip1`) and this requires using a recent nightly build of
+> Rust.
 
 ```
 rustup update
+rustup install nightly
+rustup component add rust-src --toolchain nightly
 rustup target add wasm32-wasip1
+rustup target add --toolchain nightly wasm32-wasip1
 ```
 
 Next, install WASI-SDK 30 and point `WASI_SDK_PATH` to wherever you installed
