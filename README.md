@@ -28,9 +28,9 @@ and possibly at a higher level of abstraction outside of this crate.
 - [x] support imported and exported resources
 - [x] support arbitrary WIT types
 - [x] add a license (Apache 2 + LLVM exception)
+- [x] move JS code generation out of guest code to minimize snapshot bloat
 - [ ] run linting and tests in CI
 - [ ] add a CLI interface
-- [ ] move JS code generation out of guest code to minimize snapshot bloat
 - [ ] make codegen match existing `ComponentizeJS` output
 - [ ] generate (and validate in CI) TypeScript bindings (can probably use existing `ComponentizeJS` code)
 - [ ] resource/stream/future disposal using [`Symbol.dispose`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/dispose)

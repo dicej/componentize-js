@@ -23,6 +23,7 @@ wasmtime::component::bindgen!({
     exports: { default: async },
 });
 
+mod codegen;
 #[cfg(test)]
 mod tests;
 
@@ -51,7 +52,7 @@ pub async fn componentize(
     let package = resolve.push_str("wit", wit)?;
     let world = resolve.select_world(&[package], world)?;
 
-    let mut bindings = wit_dylib::create(
+    let (mut bindings, metadata) = wit_dylib::create_with_metadata(
         &resolve,
         world,
         Some(&mut DylibOpts {
@@ -70,6 +71,9 @@ pub async fn componentize(
         )?),
     }
     .append_to(&mut bindings);
+
+    let generated_js = codegen::generate(&metadata);
+    let js = &format!("{js}\n{generated_js}");
 
     let component = {
         let mut linker = wit_component::Linker::default()
@@ -162,7 +166,7 @@ pub async fn componentize(
             })?;
     }
 
-    let component = wizer
+    wizer
         .snapshot_component(
             cx,
             &mut WasmtimeWizerComponent {
@@ -170,9 +174,5 @@ pub async fn componentize(
                 instance,
             },
         )
-        .await?;
-
-    tokio::fs::write("/tmp/foo.wasm", &component).await?;
-
-    Ok(component)
+        .await
 }
