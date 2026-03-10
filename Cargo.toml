@@ -19,6 +19,7 @@ wit-component = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" 
 wit-dylib = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
 wit-parser = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
 zstd = "0.13.3"
+heck = "0.5.0"
 
 [workspace]
 members = ["runtime"]

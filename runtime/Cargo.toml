@@ -8,6 +8,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 anyhow = "1.0.100"
+heck = "0.5.0"
 # TODO: upstream patch(es) (or figure out how live without them) and switch this dep to upstream
 mozjs = { git = "https://github.com/dicej/mozjs", rev = "1a93a3ef", default-features = false, features = ["libz-sys"] }
 wit-bindgen = { version = "0.52.0", default-features = false, features = ["macros", "realloc"] }

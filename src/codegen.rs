@@ -1,12 +1,24 @@
 use {
+    heck::ToLowerCamelCase as _,
     std::collections::BTreeMap,
     wit_dylib::metadata::{Metadata, Type},
 };
 
-pub fn generate(metadata: &Metadata) -> String {
-    // First, generate JS code which will add an `imports` property to the
-    // global object containing any and all imported functions, each of which
-    // will forward their parameters to `call_import`.
+pub struct GeneratedCode {
+    pub globals: String,
+    pub modules: Vec<(String, String)>,
+    pub script: String,
+}
+
+pub fn generate(metadata: &Metadata) -> GeneratedCode {
+    let mut modules = Vec::new();
+    let mut world_module = String::new();
+
+    // First, generate JS functions for any and all imported functions, grouping
+    // them by interface and emitting one ES module per interface, plus another
+    // for world-level imports, if applicable.  Each function will forward its
+    // parameters to `_componentizeJsCallImport`, which will be provided by
+    // the runtime to call the imported function itself.
     let mut imports = BTreeMap::<_, Vec<_>>::new();
     for (index, func) in metadata.import_funcs.iter().enumerate() {
         imports
@@ -15,44 +27,37 @@ pub fn generate(metadata: &Metadata) -> String {
             .push((index, func));
     }
 
-    let imports = imports
-        .into_iter()
-        .map(|(interface, funcs)| {
-            let funcs = funcs
-                .into_iter()
-                .map(|(index, func)| {
-                    let name = mangle_name(&func.name);
-                    let params = (0..func.args.len())
-                        .map(|i| format!("p{i}"))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let value = if func.async_import_elem_index.is_some() {
-                        format!(
-                            "new Promise((a,b)=>\
-                             componentize_js_call_import({index},[{params}],a,b))"
-                        )
-                    } else {
-                        format!("componentize_js_call_import({index},[{params}])")
-                    };
-                    format!("{name}:function({params}){{return {value}}}")
-                })
-                .collect::<Vec<_>>()
-                .join(",");
+    for (interface, funcs) in imports {
+        let funcs = funcs
+            .into_iter()
+            .map(|(index, func)| {
+                let name = mangle_name(&func.name);
+                let params = (0..func.args.len())
+                    .map(|i| format!("p{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let value = if func.async_import_elem_index.is_some() {
+                    format!(
+                        "new Promise((a,b)=>\
+                             _componentizeJsCallImport({index},[{params}],a,b))"
+                    )
+                } else {
+                    format!("_componentizeJsCallImport({index},[{params}])")
+                };
+                format!("export function {name}({params}){{return {value}}}\n")
+            })
+            .collect::<Vec<_>>()
+            .concat();
 
-            if let Some(interface) = interface {
-                let name = mangle_name(interface);
-                format!("{name}:{{{funcs}}}")
-            } else {
-                funcs
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
+        if let Some(interface) = interface {
+            modules.push((interface.to_string(), funcs));
+        } else {
+            world_module.push_str(&funcs);
+        };
+    }
 
-    // Next, generate JS code which will add a `componentize_js_async_exports`
-    // property to the global object which will wrap any and all async exports
-    // defined in the script so that they call back into Rust when the promises
-    // resolve.
+    // Next, generate wrapper functions for any and all async function exports
+    // so that they call back into the runtime when the promises resolve.
     let mut async_exports = BTreeMap::<_, Vec<_>>::new();
     for (index, func) in metadata.export_funcs.iter().enumerate() {
         // TODO: As of this writing `wit-dylib`, won't tell us which functions
@@ -86,8 +91,8 @@ pub fn generate(metadata: &Metadata) -> String {
                     let comma = if func.args.is_empty() { "" } else { "," };
                     format!(
                         "{name}:function(t{comma}{params}){{\n\
-                         return exports.{interface}{name}({params})\n\
-                         .then((v)=>componentize_js_call_task_return({index},v,t))}}"
+                         return {interface}{name}({params})\n\
+                         .then((v)=>_componentizeJsCallTaskReturn({index},v,t))}}"
                     )
                 })
                 .collect::<Vec<_>>()
@@ -102,33 +107,46 @@ pub fn generate(metadata: &Metadata) -> String {
         .collect::<Vec<_>>()
         .join(",");
 
-    // Next, generate JS code which will add a `types` property to the global
-    // object which will provide constructors for any and all future and stream
-    // types.
-    let types = metadata
-        .streams
-        .iter()
-        .enumerate()
-        .map(|(index, stream)| {
-            let name = if let Some(ty) = stream.ty {
-                let payload = mangle_ty(metadata, ty);
-                format!("{payload}_stream")
-            } else {
-                "unit_stream".into()
-            };
-            format!("{name}:function(){{return componentize_js_make_stream({index})}}")
-        })
-        .chain(metadata.futures.iter().enumerate().map(|(index, future)| {
-            let name = if let Some(ty) = future.ty {
-                let payload = mangle_ty(metadata, ty);
-                format!("{payload}_future")
-            } else {
-                "unit_future".into()
-            };
-            format!("{name}:function(){{return componentize_js_make_future({index})}}")
-        }))
-        .collect::<Vec<_>>()
-        .join(",");
+    // Next, generate constructors for any and all future and stream types.
+    //
+    // TODO: As of this writing, `wit-dylib` may generate multiple stream and/or
+    // future types for a given payload type; that's a but which should be
+    // fixed.  Meanwhile, we work around it here by deduplicating the
+    // constructors.
+    world_module.push_str(
+        &metadata
+            .streams
+            .iter()
+            .enumerate()
+            .map(|(index, stream)| {
+                let name = if let Some(ty) = stream.ty {
+                    let payload = mangle_ty(metadata, ty).to_lower_camel_case();
+                    format!("{payload}Stream")
+                } else {
+                    "unitStream".into()
+                };
+                let code = format!(
+                    "export function {name}(){{return _componentizeJsMakeStream({index})}}\n"
+                );
+                (name, code)
+            })
+            .chain(metadata.futures.iter().enumerate().map(|(index, future)| {
+                let name = if let Some(ty) = future.ty {
+                    let payload = mangle_ty(metadata, ty).to_lower_camel_case();
+                    format!("{payload}Future")
+                } else {
+                    "unitFuture".into()
+                };
+                let code = format!(
+                    "export function {name}(){{return _componentizeJsMakeFuture({index})}}\n"
+                );
+                (name, code)
+            }))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>()
+            .concat(),
+    );
 
     // Next, generate a bit of JS utility code for use with streams.
     let write_all = "async function(buffer) {
@@ -144,25 +162,19 @@ pub fn generate(metadata: &Metadata) -> String {
   return total
 }";
 
-    // For some reason I have not yet determined, we need an `await` to appear
-    // somewhere in the script to force `Promise` to be in scope.
-    //
-    // TODO: Figure out the right way to add `Promise` to the global scope
-    // without this hack:
-    let promise_hack = "(async function(){await Promise.resolve(42)})()";
+    modules.push(("wit-world".to_string(), world_module));
 
-    // Finally, combine everything together:
-    format!(
-        "var imports = {{{imports}}}\n\
-         var componentize_js_async_exports = {{{async_exports}}}\n\
-         var types = {{{types}}}\n\
-         var componentize_js_write_all = {write_all}\n\
-         var componentize_js_promise_hack = {promise_hack}"
-    )
+    // Finally, return the result:
+    GeneratedCode {
+        globals: format!("var _componentizeJsWriteAll = {write_all}\n"),
+        modules,
+        script: format!("export const _componentizeJsAsyncExports = {{{async_exports}}}"),
+    }
 }
 
 fn mangle_name(name: &str) -> String {
-    name.replace([':', '/', '-', '[', ']', '.'], "_")
+    name.replace(['@', ':', '/', '-', '[', ']', '.'], "_")
+        .to_lower_camel_case()
 }
 
 fn mangle_ty(metadata: &Metadata, ty: Type) -> String {

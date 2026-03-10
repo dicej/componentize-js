@@ -72,8 +72,9 @@ pub async fn componentize(
     }
     .append_to(&mut bindings);
 
-    let generated_js = codegen::generate(&metadata);
-    let js = &format!("{js}\n{generated_js}");
+    let generated_code = codegen::generate(&metadata);
+    let generated_script = &generated_code.script;
+    let js = &format!("{js}\n{generated_script}");
 
     let component = {
         let mut linker = wit_component::Linker::default()
@@ -154,7 +155,12 @@ pub async fn componentize(
     {
         let instance = Init::new(&mut store, &instance)?;
         instance
-            .call_init(&mut store, js)
+            .call_init(
+                &mut store,
+                &generated_code.globals,
+                &generated_code.modules,
+                js,
+            )
             .await?
             .map_err(|e| anyhow!("{e}"))
             .with_context(move || {

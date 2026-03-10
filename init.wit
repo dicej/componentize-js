@@ -1,5 +1,5 @@
 package componentize-js:init;
 
 world init {
-  export init: func(script: string) -> result<_, string>;
+  export init: func(globals: string, modules: list<tuple<string, string>>, script: string) -> result<_, string>;
 }

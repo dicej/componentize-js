@@ -297,6 +297,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures",
+ "heck",
  "hex",
  "proptest",
  "rand 0.10.0",
@@ -317,6 +318,7 @@ name = "componentize-js-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "heck",
  "mozjs",
  "wit-bindgen 0.52.0",
  "wit-dylib-ffi",

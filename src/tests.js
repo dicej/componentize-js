@@ -1,29 +1,35 @@
-async function pipe_bytes(rx, tx) {
-    while (!(rx.writer_dropped || tx.reader_dropped)) {
-        await tx.write_all(await rx.read(1024))
+import * as echoes from "componentize-js:tests/echoes"
+import * as simpleImportAndExport from "componentize-js:tests/simple-import-and-export"
+import * as simpleAsyncImportAndExport from "componentize-js:tests/simple-async-import-and-export"
+import * as hostThingInterface from "componentize-js:tests/host-thing-interface"
+import * as witWorld from "wit-world"
+
+async function pipeBytes(rx, tx) {
+    while (!(rx.writerDropped || tx.readerDropped)) {
+        await tx.writeAll(await rx.read(1024))
     }
     tx.drop()
 }
 
-async function pipe_strings(rx, tx) {
+async function pipeStrings(rx, tx) {
     await tx.write(await rx.read())
 }
 
-async function pipe_things(rx, tx) {
+async function pipeThings(rx, tx) {
     // Read the things one at a time, forcing the host to re-take ownership of
     // any unwritten items between writes.
     let things = []
-    while (!rx.writer_dropped) {
+    while (!rx.writerDropped) {
         things.push(...await rx.read(1))
     }
 
     // Write the things all at once.  The host will read them only one at a time,
     // forcing us to re-take ownership of any unwritten items between writes.
-    await tx.write_all(things)
+    await tx.writeAll(things)
     tx.drop()
 }
 
-async function write_thing(thing, tx1, tx2) {
+async function writeThing(thing, tx1, tx2) {
     // The host will drop the first reader without reading, which should give us
     // back ownership of `thing`.
     let wrote = await tx1.write(thing)
@@ -37,193 +43,192 @@ async function write_thing(thing, tx1, tx2) {
     }
 }
 
-var exports = {
-    componentize_js_tests_simple_export: {
-        foo: function(v) {
-            return v + 3
-        }
+export const componentizeJsTestsSimpleExport = {
+    foo: function(v) {
+        return v + 3
+    }
+}
+
+export const componentizeJsTestsSimpleAsyncExport = {
+    foo: function(v) {
+        return Promise.resolve(v + 3)
+    }
+}
+
+export const componentizeJsTestsSimpleImportAndExport = {
+    foo: function(v) {
+        return simpleImportAndExport.foo(v + 3)
+    }
+}
+
+export const componentizeJsTestsSimpleAsyncImportAndExport = {
+    foo: function(v) {
+        return simpleAsyncImportAndExport.foo(v + 3)
+    }
+}
+
+export const componentizeJsTestsEchoes = {
+    echoNothing: function() {
+        return echoes.echoNothing()
     },
-    componentize_js_tests_simple_async_export: {
-        foo: function(v) {
-            return Promise.resolve(v + 3)
-        }
+    echoBool: function(v) {
+        return echoes.echoBool(v)
     },
-    componentize_js_tests_simple_import_and_export: {
-        foo: function(v) {
-            return imports.componentize_js_tests_simple_import_and_export.foo(v + 3)
-        }
+    echoU8: function(v) {
+        return echoes.echoU8(v)
     },
-    componentize_js_tests_simple_async_import_and_export: {
-        foo: function(v) {
-            return imports.componentize_js_tests_simple_async_import_and_export.foo(v + 3)
-        }
+    echoS8: function(v) {
+        return echoes.echoS8(v)
     },
-    componentize_js_tests_echoes: {
-        echo_nothing: function() {
-            return imports.componentize_js_tests_echoes.echo_nothing()
-        },
-        echo_bool: function(v) {
-            return imports.componentize_js_tests_echoes.echo_bool(v)
-        },
-        echo_u8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_u8(v)
-        },
-        echo_s8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_s8(v)
-        },
-        echo_u16: function(v) {
-            return imports.componentize_js_tests_echoes.echo_u16(v)
-        },
-        echo_s16: function(v) {
-            return imports.componentize_js_tests_echoes.echo_s16(v)
-        },
-        echo_u32: function(v) {
-            return imports.componentize_js_tests_echoes.echo_u32(v)
-        },
-        echo_s32: function(v) {
-            return imports.componentize_js_tests_echoes.echo_s32(v)
-        },
-        echo_u64: function(v) {
-            return imports.componentize_js_tests_echoes.echo_u64(v)
-        },
-        echo_s64: function(v) {
-            return imports.componentize_js_tests_echoes.echo_s64(v)
-        },
-        echo_char: function(v) {
-            return imports.componentize_js_tests_echoes.echo_char(v)
-        },
-        echo_f32: function(v) {
-            return imports.componentize_js_tests_echoes.echo_f32(v)
-        },
-        echo_f64: function(v) {
-            return imports.componentize_js_tests_echoes.echo_f64(v)
-        },
-        echo_string: function(v) {
-            return imports.componentize_js_tests_echoes.echo_string(v)
-        },
-        echo_list_bool: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_bool(v)
-        },
-        echo_list_u8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_u8(v)
-        },
-        echo_list_list_u8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_list_u8(v)
-        },
-        echo_list_list_list_u8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_list_list_u8(v)
-        },
-        echo_option_u8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_option_u8(v)
-        },
-        echo_option_option_u8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_option_option_u8(v)
-        },
-        echo_list_s8: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_s8(v)
-        },
-        echo_list_u16: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_u16(v)
-        },
-        echo_list_s16: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_s16(v)
-        },
-        echo_list_u32: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_u32(v)
-        },
-        echo_list_s32: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_s32(v)
-        },
-        echo_list_u64: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_u64(v)
-        },
-        echo_list_s64: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_s64(v)
-        },
-        echo_list_char: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_char(v)
-        },
-        echo_list_f32: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_f32(v)
-        },
-        echo_list_f64: function(v) {
-            return imports.componentize_js_tests_echoes.echo_list_f64(v)
-        },
-        echo_many: function(v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16) {
-            return imports.componentize_js_tests_echoes.echo_many(
-                v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16
-            )
-        },
-        echo_resource: function(v) {
-            return imports.componentize_js_tests_echoes.echo_resource(v)
-        },
-        accept_borrow: function(v) {
-            return imports.componentize_js_tests_echoes.accept_borrow(v)
-        },
-        echo_record: function(v) {
-            return imports.componentize_js_tests_echoes.echo_record(v)
-        },
-        echo_enum: function(v) {
-            return imports.componentize_js_tests_echoes.echo_enum(v)
-        },
-        echo_flags: function(v) {
-            return imports.componentize_js_tests_echoes.echo_flags(v)
-        },
-        echo_variant: function(v) {
-            return imports.componentize_js_tests_echoes.echo_variant(v)
-        },
-        echo_stream: function(v) {
-            return imports.componentize_js_tests_echoes.echo_stream(v)
-        },
-        echo_future: function(v) {
-            return imports.componentize_js_tests_echoes.echo_future(v)
-        }
+    echoU16: function(v) {
+        return echoes.echoU16(v)
     },
-    componentize_js_tests_streams_and_futures: {
-        echo_stream_u8: function(stream) {
-            let [tx, rx] = types.u8_stream()
-            pipe_bytes(stream, tx)
-            return Promise.resolve(rx)
-        },
-        echo_future_string: function(future) {
-            let [tx, rx] = types.string_future()
-            pipe_strings(future, tx)
-            return Promise.resolve(rx)
-        },
-        short_reads: function(stream) {
-            let [tx, rx] = types.componentize_js_tests_streams_and_futures_thing_stream()
-            pipe_things(stream, tx)
-            return Promise.resolve(rx)
-        },
-        short_reads_host: function(stream) {
-            let [tx, rx] = types.componentize_js_tests_host_thing_interface_host_thing_stream()
-            pipe_things(stream, tx)
-            return Promise.resolve(rx)            
-        },
-        dropped_future_reader: function(value) {
-            let [tx1, rx1] = types.componentize_js_tests_streams_and_futures_thing_future()
-            let [tx2, rx2] = types.componentize_js_tests_streams_and_futures_thing_future()
-            write_thing({ value }, tx1, tx2)
-            return Promise.resolve([rx1, rx2])
-        },
-        dropped_future_reader_host: function(value) {
-            let [tx1, rx1] = types.componentize_js_tests_host_thing_interface_host_thing_future()
-            let [tx2, rx2] = types.componentize_js_tests_host_thing_interface_host_thing_future()
-            write_thing(
-                imports.componentize_js_tests_host_thing_interface._constructor_host_thing(value),
-                tx1,
-                tx2
-            )
-            return Promise.resolve([rx1, rx2])
-        },
-        _constructor_thing: function(value) {
-            return { value }
-        },
-        _method_thing_get: async function(thing, delay) {
-            if (delay) {
-                await imports.delay()
-            }
-            return thing.value
+    echoS16: function(v) {
+        return echoes.echoS16(v)
+    },
+    echoU32: function(v) {
+        return echoes.echoU32(v)
+    },
+    echoS32: function(v) {
+        return echoes.echoS32(v)
+    },
+    echoU64: function(v) {
+        return echoes.echoU64(v)
+    },
+    echoS64: function(v) {
+        return echoes.echoS64(v)
+    },
+    echoChar: function(v) {
+        return echoes.echoChar(v)
+    },
+    echoF32: function(v) {
+        return echoes.echoF32(v)
+    },
+    echoF64: function(v) {
+        return echoes.echoF64(v)
+    },
+    echoString: function(v) {
+        return echoes.echoString(v)
+    },
+    echoListBool: function(v) {
+        return echoes.echoListBool(v)
+    },
+    echoListU8: function(v) {
+        return echoes.echoListU8(v)
+    },
+    echoListListU8: function(v) {
+        return echoes.echoListListU8(v)
+    },
+    echoListListListU8: function(v) {
+        return echoes.echoListListListU8(v)
+    },
+    echoOptionU8: function(v) {
+        return echoes.echoOptionU8(v)
+    },
+    echoOptionOptionU8: function(v) {
+        return echoes.echoOptionOptionU8(v)
+    },
+    echoListS8: function(v) {
+        return echoes.echoListS8(v)
+    },
+    echoListU16: function(v) {
+        return echoes.echoListU16(v)
+    },
+    echoListS16: function(v) {
+        return echoes.echoListS16(v)
+    },
+    echoListU32: function(v) {
+        return echoes.echoListU32(v)
+    },
+    echoListS32: function(v) {
+        return echoes.echoListS32(v)
+    },
+    echoListU64: function(v) {
+        return echoes.echoListU64(v)
+    },
+    echoListS64: function(v) {
+        return echoes.echoListS64(v)
+    },
+    echoListChar: function(v) {
+        return echoes.echoListChar(v)
+    },
+    echoListF32: function(v) {
+        return echoes.echoListF32(v)
+    },
+    echoListF64: function(v) {
+        return echoes.echoListF64(v)
+    },
+    echoMany: function(v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16) {
+        return echoes.echoMany(
+            v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16
+        )
+    },
+    echoResource: function(v) {
+        return echoes.echoResource(v)
+    },
+    acceptBorrow: function(v) {
+        return echoes.acceptBorrow(v)
+    },
+    echoRecord: function(v) {
+        return echoes.echoRecord(v)
+    },
+    echoEnum: function(v) {
+        return echoes.echoEnum(v)
+    },
+    echoFlags: function(v) {
+        return echoes.echoFlags(v)
+    },
+    echoVariant: function(v) {
+        return echoes.echoVariant(v)
+    },
+    echoStream: function(v) {
+        return echoes.echoStream(v)
+    },
+    echoFuture: function(v) {
+        return echoes.echoFuture(v)
+    }
+}
+
+export const componentizeJsTestsStreamsAndFutures = {
+    echoStreamU8: function(stream) {
+        let [tx, rx] = witWorld.u8Stream()
+        pipeBytes(stream, tx)
+        return Promise.resolve(rx)
+    },
+    echoFutureString: function(future) {
+        let [tx, rx] = witWorld.stringFuture()
+        pipeStrings(future, tx)
+        return Promise.resolve(rx)
+    },
+    shortReads: function(stream) {
+        let [tx, rx] = witWorld.componentizeJsTestsStreamsAndFuturesThingStream()
+        pipeThings(stream, tx)
+        return Promise.resolve(rx)
+    },
+    shortReadsHost: function(stream) {
+        let [tx, rx] = witWorld.componentizeJsTestsHostThingInterfaceHostThingStream()
+        pipeThings(stream, tx)
+        return Promise.resolve(rx)            
+    },
+    droppedFutureReader: function(value) {
+        let [tx1, rx1] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
+        let [tx2, rx2] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
+        writeThing({ value }, tx1, tx2)
+        return Promise.resolve([rx1, rx2])
+    },
+    droppedFutureReaderHost: function(value) {
+        let [tx1, rx1] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
+        let [tx2, rx2] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
+        writeThing(hostThingInterface.constructorHostThing(value), tx1, tx2)
+        return Promise.resolve([rx1, rx2])
+    },
+    constructorThing: function(value) {
+        return { value }
+    },
+    methodThingGet: async function(thing, delay) {
+        if (delay) {
+            await witWorld.delay()
         }
+        return thing.value
     }
 }
