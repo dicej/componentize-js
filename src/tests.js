@@ -189,6 +189,18 @@ export const componentizeJsTestsEchoes = {
     }
 }
 
+class Thing {
+    constructor(value) {
+        this.value = value
+    }
+    async get(delay) {
+        if (delay) {
+            await witWorld.delay()
+        }
+        return this.value
+    }
+}
+
 export const componentizeJsTestsStreamsAndFutures = {
     echoStreamU8: function(stream) {
         let [tx, rx] = witWorld.u8Stream()
@@ -213,22 +225,14 @@ export const componentizeJsTestsStreamsAndFutures = {
     droppedFutureReader: function(value) {
         let [tx1, rx1] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
         let [tx2, rx2] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
-        writeThing({ value }, tx1, tx2)
+        writeThing(new Thing(value), tx1, tx2)
         return Promise.resolve([rx1, rx2])
     },
     droppedFutureReaderHost: function(value) {
         let [tx1, rx1] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
         let [tx2, rx2] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
-        writeThing(hostThingInterface.constructorHostThing(value), tx1, tx2)
+        writeThing(new hostThingInterface.HostThing(value), tx1, tx2)
         return Promise.resolve([rx1, rx2])
     },
-    constructorThing: function(value) {
-        return { value }
-    },
-    methodThingGet: async function(thing, delay) {
-        if (delay) {
-            await witWorld.delay()
-        }
-        return thing.value
-    }
+    Thing
 }

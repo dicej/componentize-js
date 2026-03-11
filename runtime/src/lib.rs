@@ -6,7 +6,7 @@
 
 use {
     anyhow::{Context as _, anyhow, bail},
-    heck::ToLowerCamelCase as _,
+    heck::{ToLowerCamelCase as _, ToUpperCamelCase as _},
     mozjs::{
         context::JSContext,
         conversions::{Utf8Chars, jsstr_to_string},
@@ -30,14 +30,14 @@ use {
         rust::{
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
             wrappers2::{
-                BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1,
+                BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
                 CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
                 IsPromiseObject, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
                 JS_DeleteProperty1, JS_GetElement, JS_GetProperty,
                 JS_InitDestroyPrincipalsCallback, JS_NewBigInt64Array, JS_NewBigUint64Array,
-                JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewStringCopyUTF8N,
-                JS_SetElement, JS_SetProperty, ModuleEvaluate, ModuleLink, NewArrayObject,
-                NewArrayObject1, NewPromiseObject, ResolvePromise, RunJobs,
+                JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewObjectWithGivenProto,
+                JS_NewStringCopyUTF8N, JS_SetElement, JS_SetProperty, ModuleEvaluate, ModuleLink,
+                NewArrayObject, NewArrayObject1, NewPromiseObject, ResolvePromise, RunJobs,
                 ThrowOnModuleEvaluationFailure,
             },
         },
@@ -860,6 +860,31 @@ unsafe extern "C" fn call_task_return(cx: *mut RawJSContext, argc: u32, vp: *mut
     true
 }
 
+unsafe extern "C" fn drop_resource(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 0);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    rooted!(&in(cx) let this = args.thisv().to_object());
+    let index = get(cx, this.handle(), TYPE_FIELD_NAME);
+    let handle = get(cx, this.handle(), HANDLE_FIELD_NAME);
+
+    if index.is_int32() && handle.is_int32() {
+        let index = index.to_int32() as u32;
+        let handle = handle.to_int32() as u32;
+        let ty = WIT.get().unwrap().resource(usize::try_from(index).unwrap());
+
+        unsafe { ty.drop()(handle) };
+
+        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
+            delete(cx, this.handle(), name);
+        }
+    }
+
+    args.rval().set(UndefinedValue());
+    true
+}
+
 unsafe extern "C" fn log(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert_eq!(argc, 1);
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
@@ -1434,59 +1459,8 @@ unsafe extern "C" fn resolve_import(
     module
 }
 
-fn init(globals: &str, modules: &[(&str, &str)], script: &str) -> anyhow::Result<()> {
-    init_runtime()?;
-
-    let cx = &mut context();
-
-    for (name, func) in [
-        (c"_componentizeJsCallImport", call_import as JsFunction),
-        (
-            c"_componentizeJsCallTaskReturn",
-            call_task_return as JsFunction,
-        ),
-        (c"_componentizeJsLog", log as JsFunction),
-        (c"_componentizeJsMakeStream", make_stream as JsFunction),
-        (c"_componentizeJsMakeFuture", make_future as JsFunction),
-    ] {
-        rooted!(&in(cx) let mut func = wrap(cx, func));
-        rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-        set(cx, global_object.handle(), name, func.handle());
-    }
-
-    let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
-    rooted!(&in(cx) let mut result = UndefinedValue());
-    if !unsafe {
-        Evaluate2(
-            cx,
-            compile_options.ptr,
-            &mut rust::transform_str_to_source_text(globals),
-            result.handle_mut(),
-        )
-    } {
-        unsafe { PrintAndClearException(cx.raw_cx()) }
-        bail!("Evaluate2 failed")
-    }
-
-    for &(name, script) in modules {
-        let module = unsafe {
-            CompileModule1(
-                cx,
-                compile_options.ptr,
-                &mut rust::transform_str_to_source_text(script),
-            )
-        };
-        if module.is_null() {
-            unsafe { PrintAndClearException(cx.raw_cx()) }
-            bail!("CompileModule1 failed")
-        }
-        MODULES
-            .try_lock()
-            .unwrap()
-            .0
-            .insert(name.into(), Heap::boxed(module));
-    }
-
+fn evaluate(cx: &mut JSContext, name: &str, script: &str) -> anyhow::Result<*mut JSObject> {
+    let compile_options = CompileOptionsWrapper::new(cx, CString::new(name)?, 1);
     let module = unsafe {
         CompileModule1(
             cx,
@@ -1504,6 +1478,8 @@ fn init(globals: &str, modules: &[(&str, &str)], script: &str) -> anyhow::Result
         unsafe { PrintAndClearException(cx.raw_cx()) }
         bail!("ModuleLink failed")
     }
+
+    rooted!(&in(cx) let mut result = UndefinedValue());
     if !unsafe { ModuleEvaluate(cx, module.handle(), result.handle_mut()) } {
         unsafe { PrintAndClearException(cx.raw_cx()) }
         bail!("ModuleEvaluate failed")
@@ -1528,7 +1504,55 @@ fn init(globals: &str, modules: &[(&str, &str)], script: &str) -> anyhow::Result
         GetPromiseState(result.handle())
     });
 
-    *MAIN_MODULE.try_lock().unwrap() = Some(SyncSend(Heap::boxed(module.get())));
+    Ok(module.get())
+}
+
+fn init(globals: &str, modules: &[(&str, &str)], script: &str) -> anyhow::Result<()> {
+    init_runtime()?;
+
+    let cx = &mut context();
+
+    for (name, func) in [
+        (c"_componentizeJsCallImport", call_import as JsFunction),
+        (
+            c"_componentizeJsCallTaskReturn",
+            call_task_return as JsFunction,
+        ),
+        (c"_componentizeJsDropResource", drop_resource as JsFunction),
+        (c"_componentizeJsLog", log as JsFunction),
+        (c"_componentizeJsMakeStream", make_stream as JsFunction),
+        (c"_componentizeJsMakeFuture", make_future as JsFunction),
+    ] {
+        rooted!(&in(cx) let mut func = wrap(cx, func));
+        rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+        set(cx, global_object.handle(), name, func.handle());
+    }
+
+    let compile_options = CompileOptionsWrapper::new(cx, c"script".into(), 1);
+    rooted!(&in(cx) let mut result = UndefinedValue());
+    if !unsafe {
+        Evaluate2(
+            cx,
+            compile_options.ptr,
+            &mut rust::transform_str_to_source_text(globals),
+            result.handle_mut(),
+        )
+    } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        bail!("Evaluate2 failed")
+    }
+
+    for &(name, script) in modules {
+        let module = evaluate(cx, name, script)?;
+        MODULES
+            .try_lock()
+            .unwrap()
+            .0
+            .insert(name.into(), Heap::boxed(module));
+    }
+
+    let module = evaluate(cx, "script", script)?;
+    *MAIN_MODULE.try_lock().unwrap() = Some(SyncSend(Heap::boxed(module)));
 
     Ok(())
 }
@@ -1621,40 +1645,129 @@ impl MyInterpreter {
             );
         }
 
-        let function = get(
-            cx,
-            object.handle(),
-            &CString::new(mangle_name(func.name())).unwrap(),
-        );
-        rooted!(&in(cx) let mut function = function);
+        let params = |call: &mut MyCall, offset| {
+            if async_ {
+                Some(UInt32Value(
+                    (Arc::into_raw(call.traced.clone()) as usize)
+                        .try_into()
+                        .unwrap(),
+                ))
+            } else {
+                None
+            }
+            .into_iter()
+            .chain(
+                call.traced
+                    .try_lock()
+                    .unwrap()
+                    .stack
+                    .drain(offset..)
+                    .map(|v| v.get()),
+            )
+            .collect::<Vec<_>>()
+        };
 
-        if function.is_undefined() {
-            panic!("export `{}` not defined", mangle_name(func.name()));
-        }
+        let result = if let Some(ty) = func.name().strip_prefix("[constructor]") {
+            assert!(!async_);
 
-        let params = if async_ {
-            Some(UInt32Value(
-                (Arc::into_raw(call.traced.clone()) as usize)
-                    .try_into()
-                    .unwrap(),
-            ))
+            let class = get(
+                cx,
+                object.handle(),
+                &CString::new(ty.to_upper_camel_case()).unwrap(),
+            );
+            rooted!(&in(cx) let class = class);
+            if class.is_undefined() {
+                panic!("export `{}` not defined", ty.to_upper_camel_case());
+            }
+            rooted!(&in(cx) let mut result = ptr::null_mut::<JSObject>());
+            rooted!(&in(cx) let params = params(call, 0));
+            if !unsafe {
+                Construct1(
+                    cx,
+                    class.handle(),
+                    &HandleValueArray::from(&params),
+                    result.handle_mut(),
+                )
+            } {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("Construct1 failed")
+            }
+            ObjectValue(result.get())
+        } else if let Some(name) = func.name().strip_prefix("[method]") {
+            let (ty, name) = name.split_once('.').unwrap();
+            let class = get(
+                cx,
+                object.handle(),
+                &CString::new(ty.to_upper_camel_case()).unwrap(),
+            );
+            rooted!(&in(cx) let class = class);
+            if class.is_undefined() {
+                panic!("export `{}` not defined", ty.to_upper_camel_case());
+            }
+            rooted!(&in(cx) let object = class.to_object());
+            let function = get(
+                cx,
+                object.handle(),
+                &CString::new(name.to_lower_camel_case()).unwrap(),
+            );
+            rooted!(&in(cx) let function = function);
+            if function.is_undefined() {
+                panic!("export `{}` not defined", mangle_name(func.name()));
+            }
+            rooted!(&in(cx) let params = params(call, 1));
+            rooted!(&in(cx) let this = call.pop().to_object());
+            self::call(
+                cx,
+                this.handle(),
+                function.handle(),
+                &HandleValueArray::from(&params),
+            )
+        } else if let Some(name) = func.name().strip_prefix("[static]") {
+            let (ty, name) = name.split_once('.').unwrap();
+            let class = get(
+                cx,
+                object.handle(),
+                &CString::new(ty.to_upper_camel_case()).unwrap(),
+            );
+            rooted!(&in(cx) let class = class);
+            if class.is_undefined() {
+                panic!("export `{}` not defined", ty.to_upper_camel_case());
+            }
+            rooted!(&in(cx) let object = class.to_object());
+            let function = get(
+                cx,
+                object.handle(),
+                &CString::new(name.to_lower_camel_case()).unwrap(),
+            );
+            rooted!(&in(cx) let function = function);
+            if function.is_undefined() {
+                panic!("export `{}` not defined", mangle_name(func.name()));
+            }
+            rooted!(&in(cx) let params = params(call, 0));
+            self::call(
+                cx,
+                object.handle(),
+                function.handle(),
+                &HandleValueArray::from(&params),
+            )
         } else {
-            None
-        }
-        .into_iter()
-        .chain(
-            mem::take(&mut call.traced.try_lock().unwrap().stack)
-                .into_iter()
-                .map(|v| v.get()),
-        )
-        .collect::<Vec<_>>();
-        rooted!(&in(cx) let params = params);
-        let result = self::call(
-            cx,
-            object.handle(),
-            function.handle(),
-            &HandleValueArray::from(&params),
-        );
+            let function = get(
+                cx,
+                object.handle(),
+                &CString::new(mangle_name(func.name())).unwrap(),
+            );
+            rooted!(&in(cx) let function = function);
+            if function.is_undefined() {
+                panic!("export `{}` not defined", mangle_name(func.name()));
+            }
+            rooted!(&in(cx) let params = params(call, 0));
+            self::call(
+                cx,
+                object.handle(),
+                function.handle(),
+                &HandleValueArray::from(&params),
+            )
+        };
 
         if async_ {
             poll(cx)
@@ -2446,7 +2559,7 @@ impl Call for MyCall<'_> {
                 .get()
         } else {
             // imported resource type
-            let value = imported_resource_from_canon(&mut context(), ty.index(), handle);
+            let value = imported_resource_from_canon(&mut context(), ty.index(), handle, Some(ty));
 
             self.traced.try_lock().unwrap().borrows.push(Borrow {
                 value: Heap::boxed(value),
@@ -2472,13 +2585,13 @@ impl Call for MyCall<'_> {
             value.get()
         } else {
             // imported resource type
-            imported_resource_from_canon(cx, ty.index(), handle)
+            imported_resource_from_canon(cx, ty.index(), handle, Some(ty))
         }));
     }
 
     fn push_future(&mut self, ty: wit::Future, handle: u32) {
         let cx = &mut context();
-        let stream = imported_resource_from_canon(cx, ty.index(), handle);
+        let stream = imported_resource_from_canon(cx, ty.index(), handle, None);
         rooted!(&in(cx) let rx = stream);
         for (name, func) in [
             (c"read", future_read as JsFunction),
@@ -2492,7 +2605,7 @@ impl Call for MyCall<'_> {
 
     fn push_stream(&mut self, ty: wit::Stream, handle: u32) {
         let cx = &mut context();
-        let stream = imported_resource_from_canon(cx, ty.index(), handle);
+        let stream = imported_resource_from_canon(cx, ty.index(), handle, None);
         rooted!(&in(cx) let rx = stream);
         for (name, func) in [
             (c"read", stream_read as JsFunction),
@@ -2594,8 +2707,36 @@ impl Call for MyCall<'_> {
 
 wit_dylib_ffi::export!(MyInterpreter);
 
-fn imported_resource_from_canon(cx: &mut JSContext, index: usize, handle: u32) -> *mut JSObject {
-    rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
+fn imported_resource_from_canon(
+    cx: &mut JSContext,
+    index: usize,
+    handle: u32,
+    ty: Option<wit::Resource>,
+) -> *mut JSObject {
+    let wrapper = if let Some(ty) = ty {
+        let module = MODULES
+            .try_lock()
+            .unwrap()
+            .0
+            .get(ty.interface().unwrap_or("witWorld"))
+            .unwrap()
+            .get();
+        rooted!(&in(cx) let mut module = module);
+        rooted!(&in(cx) let mut object = unsafe {
+            mozjs::rust::wrappers2::GetModuleNamespace(cx, module.handle())
+        });
+        let proto = get(
+            cx,
+            object.handle(),
+            &CString::new(ty.name().to_upper_camel_case()).unwrap(),
+        )
+        .to_object();
+        rooted!(&in(cx) let proto = proto);
+        unsafe { JS_NewObjectWithGivenProto(cx, ptr::null_mut(), proto.handle()) }
+    } else {
+        unsafe { JS_NewObject(cx, ptr::null_mut()) }
+    };
+    rooted!(&in(cx) let wrapper = wrapper);
     rooted!(&in(cx) let handle = UInt32Value(handle));
     set(cx, wrapper.handle(), HANDLE_FIELD_NAME, handle.handle());
 
