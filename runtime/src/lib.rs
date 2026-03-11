@@ -23,8 +23,8 @@ use {
             OnNewGlobalHookOption, PromiseState, SetModuleResolveHook, TraceKind, Value,
         },
         jsval::{
-            BigIntValue, BooleanValue, DoubleValue, Int32Value, NullValue, ObjectValue,
-            StringValue, UInt32Value, UndefinedValue,
+            BigIntValue, BooleanValue, DoubleValue, Int32Value, ObjectValue, StringValue,
+            UInt32Value, UndefinedValue,
         },
         rooted,
         rust::{
@@ -2150,16 +2150,22 @@ impl Call for MyCall<'_> {
         }
     }
 
-    fn pop_enum(&mut self, _ty: wit::Enum) -> u32 {
+    fn pop_enum(&mut self, ty: wit::Enum) -> u32 {
         let cx = &mut context();
-        rooted!(&in(cx) let wrapper = self.pop().to_object());
-        get(cx, wrapper.handle(), c"discriminant").to_int32() as u32
+        let tag =
+            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(self.pop().to_string()).unwrap()) };
+        // TODO: use e.g. a HashMap to make this more efficient:
+        ty.names()
+            .position(|v| v == tag.as_str())
+            .unwrap()
+            .try_into()
+            .unwrap()
     }
 
     fn pop_flags(&mut self, _ty: wit::Flags) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        get(cx, wrapper.handle(), c"value").to_int32() as u32
+        get(cx, wrapper.handle(), c"val").to_int32() as u32
     }
 
     fn pop_future(&mut self, _ty: wit::Future) -> u32 {
@@ -2175,14 +2181,14 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_option(&mut self, ty: WitOption) -> u32 {
-        if self.last().is_null() {
+        if self.last().is_undefined() {
             self.pop();
             0
         } else {
             if let Type::Option(_) = ty.ty() {
                 let cx = &mut context();
                 rooted!(&in(cx) let wrapper = self.pop().to_object());
-                self.push(get(cx, wrapper.handle(), c"value"));
+                self.push(get(cx, wrapper.handle(), c"val"));
             } else {
                 // Leave value on the stack as-is.
             }
@@ -2193,16 +2199,21 @@ impl Call for MyCall<'_> {
     fn pop_result(&mut self, ty: WitResult) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        let discriminant = get(cx, wrapper.handle(), c"discriminant").to_int32() as u32;
+        let tag = unsafe {
+            jsstr_to_string(
+                cx.raw_cx(),
+                NonNull::new(get(cx, wrapper.handle(), c"tag").to_string()).unwrap(),
+            )
+        };
 
-        let has_payload = match discriminant {
-            0 => ty.ok().is_some(),
-            1 => ty.err().is_some(),
+        let (discriminant, has_payload) = match tag.as_str() {
+            "ok" => (0, ty.ok().is_some()),
+            "err" => (1, ty.err().is_some()),
             _ => unreachable!(),
         };
 
         if has_payload {
-            self.push(get(cx, wrapper.handle(), c"value"));
+            self.push(get(cx, wrapper.handle(), c"val"));
         }
 
         discriminant
@@ -2211,20 +2222,25 @@ impl Call for MyCall<'_> {
     fn pop_variant(&mut self, ty: wit::Variant) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
-        let discriminant = get(cx, wrapper.handle(), c"discriminant").to_int32() as u32;
+        let tag = unsafe {
+            jsstr_to_string(
+                cx.raw_cx(),
+                NonNull::new(get(cx, wrapper.handle(), c"tag").to_string()).unwrap(),
+            )
+        };
 
-        let has_payload = ty
+        // TODO: use e.g. a HashMap to make this more efficient:
+        let (discriminant, (_, payload_type)) = ty
             .cases()
-            .nth(usize::try_from(discriminant).unwrap())
-            .unwrap()
-            .1
-            .is_some();
+            .enumerate()
+            .find(|(_, (v, _))| *v == tag.as_str())
+            .unwrap();
 
-        if has_payload {
-            self.push(get(cx, wrapper.handle(), c"value"));
+        if payload_type.is_some() {
+            self.push(get(cx, wrapper.handle(), c"val"));
         }
 
-        discriminant
+        discriminant.try_into().unwrap()
     }
 
     fn pop_record(&mut self, ty: wit::Record) {
@@ -2405,16 +2421,18 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
         rooted!(&in(cx) let value = UInt32Value(bits));
-        set(cx, wrapper.handle(), c"value", value.handle());
+        set(cx, wrapper.handle(), c"val", value.handle());
         self.push(ObjectValue(wrapper.get()));
     }
 
-    fn push_enum(&mut self, _ty: wit::Enum, discriminant: u32) {
+    fn push_enum(&mut self, ty: wit::Enum, discriminant: u32) {
         let cx = &mut context();
-        rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
-        rooted!(&in(cx) let discriminant = UInt32Value(discriminant));
-        set(cx, wrapper.handle(), c"discriminant", discriminant.handle());
-        self.push(ObjectValue(wrapper.get()));
+        self.push(StringValue(unsafe {
+            &*JS_NewStringCopyUTF8N(
+                cx,
+                &*Utf8Chars::from(ty.names().nth(discriminant.try_into().unwrap()).unwrap()),
+            )
+        }));
     }
 
     fn push_borrow(&mut self, ty: wit::Resource, handle: u32) {
@@ -2489,20 +2507,17 @@ impl Call for MyCall<'_> {
     fn push_variant(&mut self, ty: wit::Variant, discriminant: u32) {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
-        {
-            rooted!(&in(cx) let discriminant = UInt32Value(discriminant));
-            set(cx, wrapper.handle(), c"discriminant", discriminant.handle());
-        }
 
-        if ty
-            .cases()
-            .nth(discriminant.try_into().unwrap())
-            .unwrap()
-            .1
-            .is_some()
-        {
+        let (tag, payload_type) = ty.cases().nth(discriminant.try_into().unwrap()).unwrap();
+
+        rooted!(&in(cx) let tag = StringValue(unsafe {
+            &*JS_NewStringCopyUTF8N(cx, &*Utf8Chars::from(tag))
+        }));
+        set(cx, wrapper.handle(), c"tag", tag.handle());
+
+        if payload_type.is_some() {
             rooted!(&in(cx) let value = self.pop());
-            set(cx, wrapper.handle(), c"value", value.handle());
+            set(cx, wrapper.handle(), c"val", value.handle());
         }
 
         self.push(ObjectValue(wrapper.get()));
@@ -2514,25 +2529,31 @@ impl Call for MyCall<'_> {
                 let cx = &mut context();
                 rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
                 rooted!(&in(cx) let value = self.pop());
-                set(cx, wrapper.handle(), c"value", value.handle());
+                set(cx, wrapper.handle(), c"val", value.handle());
                 self.push(ObjectValue(wrapper.get()));
             } else {
                 // Leave payload on the stack as-is.
             }
         } else {
-            self.push(NullValue());
+            self.push(UndefinedValue());
         }
     }
 
     fn push_result(&mut self, ty: WitResult, is_err: bool) {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = unsafe { JS_NewObject(cx, ptr::null_mut()) });
-        rooted!(&in(cx) let discriminant = UInt32Value(if is_err { 1 } else { 0}));
-        set(cx, wrapper.handle(), c"discriminant", discriminant.handle());
+
+        let tag = if is_err { "err" } else { "ok" };
+        rooted!(&in(cx) let tag = StringValue(unsafe {
+            &*JS_NewStringCopyUTF8N(cx, &*Utf8Chars::from(tag))
+        }));
+        set(cx, wrapper.handle(), c"tag", tag.handle());
+
         if (is_err && ty.err().is_some()) || (!is_err && ty.ok().is_some()) {
             rooted!(&in(cx) let value = self.pop());
-            set(cx, wrapper.handle(), c"value", value.handle());
+            set(cx, wrapper.handle(), c"val", value.handle());
         }
+
         self.push(ObjectValue(wrapper.get()));
     }
 
