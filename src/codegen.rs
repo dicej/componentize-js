@@ -151,10 +151,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
     // Next, generate a bit of JS utility code for use with streams.
     let write_all = "async function(buffer) {
   let total = 0
-  while (((buffer.byteLength !== undefined && buffer.byteLength > 0)
-          || (buffer.length !== undefined && buffer.length > 0))
-         && !this.reader_dropped)
-  {
+  while (buffer.length > 0 && !this.reader_dropped) {
     count = await this.write(buffer)
     buffer = buffer.slice(count)
     total += count

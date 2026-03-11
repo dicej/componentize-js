@@ -13,7 +13,8 @@ use {
         gc::Handle,
         glue::{
             CallObjectTracer, CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
-            JSPrincipalsCallbacks, PrintAndClearException,
+            GetBigInt64ArrayLengthAndData, GetBigUint64ArrayLengthAndData, JSPrincipalsCallbacks,
+            PrintAndClearException,
         },
         jsapi::{
             GCTraceKindToAscii, Handle as RawHandle, HandleValueArray, Heap, JS_CallArgsFromVp,
@@ -33,13 +34,18 @@ use {
                 CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
                 IsPromiseObject, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
                 JS_DeleteProperty1, JS_GetElement, JS_GetProperty,
-                JS_InitDestroyPrincipalsCallback, JS_NewFunction, JS_NewGlobalObject, JS_NewObject,
-                JS_NewStringCopyUTF8N, JS_SetElement, JS_SetProperty, ModuleEvaluate, ModuleLink,
-                NewArrayObject, NewArrayObject1, NewPromiseObject, ResolvePromise, RunJobs,
+                JS_InitDestroyPrincipalsCallback, JS_NewBigInt64Array, JS_NewBigUint64Array,
+                JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewStringCopyUTF8N,
+                JS_SetElement, JS_SetProperty, ModuleEvaluate, ModuleLink, NewArrayObject,
+                NewArrayObject1, NewPromiseObject, ResolvePromise, RunJobs,
                 ThrowOnModuleEvaluationFailure,
             },
         },
-        typedarray::{ArrayBuffer, CreateWith},
+        typedarray::{
+            CreateWith, Float32, Float32Array, Float64, Float64Array, Int8, Int8Array, Int16,
+            Int16Array, Int32, Int32Array, TypedArrayElement as _, Uint8, Uint8Array, Uint16,
+            Uint16Array, Uint32, Uint32Array,
+        },
     },
     std::{
         alloc::{self, Layout},
@@ -551,6 +557,199 @@ fn restore_resources(cx: &mut JSContext, traced: &Mutex<TransmitTraced>, count: 
     }
 }
 
+unsafe fn create_typed_array(
+    cx: &mut JSContext,
+    ty: Type,
+    buffer: *const u8,
+    count: usize,
+) -> Value {
+    rooted!(&in(cx) let mut array = ptr::null_mut::<JSObject>());
+    unsafe {
+        match ty {
+            Type::U8 => Uint8Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer, count)),
+                array.handle_mut(),
+            ),
+            Type::S8 => Int8Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            Type::U16 => Uint16Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            Type::S16 => Int16Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            Type::U32 => Uint32Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            Type::S32 => Int32Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            Type::U64 => {
+                // As of this writing, `mozjs::typedarray::BigUint64Array` does
+                // not yet exist, so we have use lower-level APIs.
+                array.set(JS_NewBigUint64Array(cx, count));
+                let mut length = 0;
+                let mut is_shared_memory = false;
+                let mut data = ptr::null_mut();
+                GetBigUint64ArrayLengthAndData(
+                    array.get(),
+                    &mut length,
+                    &mut is_shared_memory,
+                    &mut data,
+                );
+                assert_eq!(length, count);
+                ptr::copy_nonoverlapping(buffer.cast(), data, count);
+                Ok(())
+            }
+            Type::S64 => {
+                // As of this writing, `mozjs::typedarray::BigInt64Array` does
+                // not yet exist, so we have use lower-level APIs.
+                array.set(JS_NewBigInt64Array(cx, count));
+                let mut length = 0;
+                let mut is_shared_memory = false;
+                let mut data = ptr::null_mut();
+                GetBigInt64ArrayLengthAndData(
+                    array.get(),
+                    &mut length,
+                    &mut is_shared_memory,
+                    &mut data,
+                );
+                assert_eq!(length, count);
+                ptr::copy_nonoverlapping(buffer.cast(), data, count);
+                Ok(())
+            }
+            Type::F32 => Float32Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            Type::F64 => Float64Array::create(
+                cx.raw_cx(),
+                CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
+                array.handle_mut(),
+            ),
+            _ => unreachable!(),
+        }
+        .unwrap()
+    }
+    ObjectValue(array.get())
+}
+
+unsafe fn typed_array_data(ty: Type, array: *mut JSObject) -> (*mut u8, usize, Layout) {
+    unsafe {
+        match ty {
+            Type::U8 => {
+                let (data, length) = Uint8::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length, 1).unwrap(),
+                )
+            }
+            Type::S8 => {
+                let (data, length) = Int8::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length, 1).unwrap(),
+                )
+            }
+            Type::U16 => {
+                let (data, length) = Uint16::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 2, 2).unwrap(),
+                )
+            }
+            Type::S16 => {
+                let (data, length) = Int16::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 2, 2).unwrap(),
+                )
+            }
+            Type::U32 => {
+                let (data, length) = Uint32::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 4, 4).unwrap(),
+                )
+            }
+            Type::S32 => {
+                let (data, length) = Int32::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 4, 4).unwrap(),
+                )
+            }
+            Type::U64 => {
+                // As of this writing, `mozjs::typedarray::BigUint64` does not
+                // yet exist, so we have use a lower-level API.
+                let mut length = 0;
+                let mut is_shared_memory = false;
+                let mut data = ptr::null_mut();
+                GetBigUint64ArrayLengthAndData(
+                    array,
+                    &mut length,
+                    &mut is_shared_memory,
+                    &mut data,
+                );
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 8, 8).unwrap(),
+                )
+            }
+            Type::S64 => {
+                // As of this writing, `mozjs::typedarray::BigInt64` does not
+                // yet exist, so we have use a lower-level API.
+                let mut length = 0;
+                let mut is_shared_memory = false;
+                let mut data = ptr::null_mut();
+                GetBigInt64ArrayLengthAndData(array, &mut length, &mut is_shared_memory, &mut data);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 8, 8).unwrap(),
+                )
+            }
+            Type::F32 => {
+                let (data, length) = Float32::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 4, 4).unwrap(),
+                )
+            }
+            Type::F64 => {
+                let (data, length) = Float64::length_and_data(array);
+                (
+                    data.cast(),
+                    length,
+                    Layout::from_size_align(length * 8, 8).unwrap(),
+                )
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert!(argc >= 2);
 
@@ -681,8 +880,8 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     rooted!(&in(cx) let values = args.index(0).to_object());
     let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
 
-    let write_count = if let Some(Type::U8 | Type::S8) = ty.ty() {
-        ArrayBuffer::from(values.get()).unwrap().len()
+    let write_count = if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
+        unsafe { typed_array_data(ty, args.index(0).to_object()) }.1
     } else {
         // TODO: Is there a quicker way to get the array length, e.g. using
         // `JS_GetPropertyById`?
@@ -704,14 +903,14 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
 
     let traced = TransmitTraced::new(this.get(), promise.get(), None);
 
-    if let Some(Type::U8 | Type::S8) = ty.ty() {
-        let js_buffer = ArrayBuffer::from(args.index(0).to_object()).unwrap();
+    if let Some(payload_type) = ty.ty().filter(|&v| use_typed_array(v)) {
+        let (data, length, _) =
+            unsafe { typed_array_data(payload_type, args.index(0).to_object()) };
+        assert_eq!(length, write_count);
         // TODO: Can we avoid the copy here by telling SpiderMonkey to pin the
-        // buffer so it can't be moved, collected, or resized until we've
-        // unpinned it?
-        unsafe {
-            slice::from_raw_parts_mut(buffer, write_count).copy_from_slice(js_buffer.as_slice())
-        };
+        // typed array buffer so it can't be moved, collected, or resized until
+        // we've unpinned it?
+        unsafe { ptr::copy_nonoverlapping(data, buffer, write_count * ty.abi_payload_size()) };
     } else {
         let mut need_restore_resources = false;
         traced.try_lock().unwrap().resources = Some(Vec::with_capacity(write_count));
@@ -854,17 +1053,8 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
             set(cx, this.handle(), c"writerDropped", value.handle());
         }
 
-        if let Some(Type::U8 | Type::S8) = ty.ty() {
-            rooted!(&in(cx) let mut js_buffer = ptr::null_mut::<JSObject>());
-            unsafe {
-                ArrayBuffer::create(
-                    cx.raw_cx(),
-                    CreateWith::Slice(slice::from_raw_parts(buffer, count)),
-                    js_buffer.handle_mut(),
-                )
-                .unwrap()
-            }
-            rooted!(&in(cx) let value = ObjectValue(js_buffer.get()));
+        if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
+            rooted!(&in(cx) let value = unsafe { create_typed_array(cx, ty, buffer, count) });
             resolve(cx, promise.handle(), value.handle());
         } else {
             rooted!(&in(cx) let array = unsafe { NewArrayObject1(cx, count) });
@@ -1631,17 +1821,8 @@ impl Interpreter for MyInterpreter {
 
                 assert!(traced.try_lock().unwrap().resources.is_none());
 
-                if let Some(Type::U8 | Type::S8) = ty.ty() {
-                    rooted!(&in(cx) let mut js_buffer = ptr::null_mut::<JSObject>());
-                    unsafe {
-                        ArrayBuffer::create(
-                            cx.raw_cx(),
-                            CreateWith::Slice(slice::from_raw_parts(buffer.cast(), count)),
-                            js_buffer.handle_mut(),
-                        )
-                        .unwrap()
-                    }
-                    rooted!(&in(cx) let value = ObjectValue(js_buffer.get()));
+                if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
+                    rooted!(&in(cx) let value = unsafe { create_typed_array(cx, ty, *buffer, count) });
                     resolve(cx, promise.handle(), value.handle());
                 } else {
                     rooted!(&in(cx) let array = unsafe { NewArrayObject1(cx, count) });
@@ -2072,15 +2253,12 @@ impl Call for MyCall<'_> {
     }
 
     unsafe fn maybe_pop_list(&mut self, ty: List) -> Option<(*const u8, usize)> {
-        if let Type::U8 | Type::S8 = ty.ty() {
-            let buffer = ArrayBuffer::from(self.pop().to_object()).unwrap();
-            let len = buffer.len();
-            let dst = unsafe {
-                let dst = alloc::alloc(Layout::from_size_align(len, 1).unwrap());
-                slice::from_raw_parts_mut(dst, len).copy_from_slice(buffer.as_slice());
-                dst
-            };
-            Some((dst as _, len))
+        if use_typed_array(ty.ty()) {
+            let (data, length, layout) =
+                unsafe { typed_array_data(ty.ty(), self.pop().to_object()) };
+            let dst = unsafe { alloc::alloc(layout) };
+            unsafe { ptr::copy_nonoverlapping(data, dst, layout.size()) };
+            Some((dst as _, length))
         } else {
             None
         }
@@ -2359,18 +2537,8 @@ impl Call for MyCall<'_> {
     }
 
     unsafe fn push_raw_list(&mut self, ty: List, src: *mut u8, len: usize) -> bool {
-        if let Type::U8 | Type::S8 = ty.ty() {
-            let cx = &mut context();
-            rooted!(&in(cx) let mut buffer = ptr::null_mut::<JSObject>());
-            unsafe {
-                ArrayBuffer::create(
-                    cx.raw_cx(),
-                    CreateWith::Slice(slice::from_raw_parts(src, len)),
-                    buffer.handle_mut(),
-                )
-                .unwrap()
-            }
-            self.push(ObjectValue(buffer.get()));
+        if use_typed_array(ty.ty()) {
+            self.push(unsafe { create_typed_array(&mut context(), ty.ty(), src, len) });
             true
         } else {
             false
@@ -2552,6 +2720,22 @@ unsafe extern "C" fn trace_roots(tracer: *mut JSTracer, _: *mut c_void) {
 fn mangle_name(name: &str) -> String {
     name.replace(['@', ':', '/', '-', '[', ']', '.'], "_")
         .to_lower_camel_case()
+}
+
+fn use_typed_array(ty: Type) -> bool {
+    matches!(
+        ty,
+        Type::U8
+            | Type::S8
+            | Type::U16
+            | Type::S16
+            | Type::U32
+            | Type::S32
+            | Type::U64
+            | Type::S64
+            | Type::F32
+            | Type::F64
+    )
 }
 
 // As of this writing, recent Rust `nightly` builds include a version of the
