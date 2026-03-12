@@ -15,12 +15,33 @@ async function pipeStrings(rx, tx) {
     await tx.write(await rx.read())
 }
 
-async function pipeThings(rx, tx) {
+async function pipeThings(rx, tx, class_) {
     // Read the things one at a time, forcing the host to re-take ownership of
     // any unwritten items between writes.
     let things = []
     while (!rx.writerDropped) {
         things.push(...await rx.read(1))
+    }
+
+    let strings = ["a", "b", "c", "d", "e"];
+    if (things.length !== strings.length) {
+        throw `expected ${strings.length} things; got ${things.length}`
+    }
+    
+    for (let i = 0; i < things.length; ++i) {
+        if (!(things[i] instanceof class_)) {
+            throw `expected ${class_.name}; got ${things[i].constructor.name}`
+        }
+        
+        let s = await things[i].get()
+        if (s !== strings[i]) {
+            throw `expected ${strings[i]}; got ${s}`
+        }
+
+        s = await class_.getStatic(things[i])
+        if (s !== strings[i]) {
+            throw `expected ${strings[i]}; got ${s}`
+        }
     }
 
     // Write the things all at once.  The host will read them only one at a time,
@@ -128,6 +149,12 @@ export const componentizeJsTestsEchoes = {
     echoOptionOptionU8: function(v) {
         return echoes.echoOptionOptionU8(v)
     },
+    echoResultU8U8: function(v) {
+        return echoes.echoResultU8U8(v)
+    },
+    echoResultResultU8U8U8: function(v) {
+        return echoes.echoResultResultU8U8U8(v)
+    },
     echoListS8: function(v) {
         return echoes.echoListS8(v)
     },
@@ -199,39 +226,50 @@ class Thing {
         }
         return this.value
     }
+    static async getStatic(v, delay) {
+        if (delay) {
+            await witWorld.delay()
+        }
+        return v.value
+    }
 }
 
 export const componentizeJsTestsStreamsAndFutures = {
     echoStreamU8: function(stream) {
         let [tx, rx] = witWorld.u8Stream()
         pipeBytes(stream, tx)
+            .catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve(rx)
     },
     echoFutureString: function(future) {
         let [tx, rx] = witWorld.stringFuture()
         pipeStrings(future, tx)
+            .catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve(rx)
     },
     shortReads: function(stream) {
         let [tx, rx] = witWorld.componentizeJsTestsStreamsAndFuturesThingStream()
-        pipeThings(stream, tx)
+        pipeThings(stream, tx, Thing)
+            .catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve(rx)
     },
     shortReadsHost: function(stream) {
         let [tx, rx] = witWorld.componentizeJsTestsHostThingInterfaceHostThingStream()
-        pipeThings(stream, tx)
+        pipeThings(stream, tx, hostThingInterface.HostThing)
+            .catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve(rx)            
     },
     droppedFutureReader: function(value) {
         let [tx1, rx1] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
         let [tx2, rx2] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
-        writeThing(new Thing(value), tx1, tx2)
+        writeThing(new Thing(value), tx1, tx2).catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve([rx1, rx2])
     },
     droppedFutureReaderHost: function(value) {
         let [tx1, rx1] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
         let [tx2, rx2] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
         writeThing(new hostThingInterface.HostThing(value), tx1, tx2)
+            .catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve([rx1, rx2])
     },
     Thing

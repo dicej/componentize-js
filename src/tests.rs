@@ -321,6 +321,17 @@ impl componentize_js::tests::echoes::Host for Ctx {
         Ok(v)
     }
 
+    async fn echo_result_u8_u8(&mut self, v: Result<u8, u8>) -> anyhow::Result<Result<u8, u8>> {
+        Ok(v)
+    }
+
+    async fn echo_result_result_u8_u8_u8(
+        &mut self,
+        v: Result<Result<u8, u8>, u8>,
+    ) -> anyhow::Result<Result<Result<u8, u8>, u8>> {
+        Ok(v)
+    }
+
     async fn echo_many(
         &mut self,
         v1: bool,
@@ -792,6 +803,47 @@ fn echo_options_option_u8() -> anyhow::Result<()> {
                 instance
                     .componentize_js_tests_echoes()
                     .call_echo_option_option_u8(&mut store, value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_results_u8_u8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::result::maybe_ok(proptest::num::u8::ANY, proptest::num::u8::ANY),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_result_u8_u8(&mut store, value)
+                    .await?
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn echo_results_result_u8_u8_u8() -> anyhow::Result<()> {
+    proptest(
+        &proptest::result::maybe_ok(
+            proptest::result::maybe_ok(proptest::num::u8::ANY, proptest::num::u8::ANY),
+            proptest::num::u8::ANY,
+        ),
+        async |value| {
+            let mut store = store();
+            let instance = pre().await.instantiate_async(&mut store).await?;
+            assert_eq!(
+                value,
+                instance
+                    .componentize_js_tests_echoes()
+                    .call_echo_result_result_u8_u8_u8(&mut store, value)
                     .await?
             );
             Ok(())
@@ -1569,6 +1621,29 @@ async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
             );
 
+            // Do the above again, but this time using `thing.get-static`.
+            let mut futures = FuturesUnordered::new();
+            for (index, &it) in received_things.iter().enumerate() {
+                futures.push(
+                    thing
+                        .call_get_static(store, it, delay)
+                        .map(move |v| v.map(move |v| (index, v))),
+                );
+            }
+
+            let mut received_strings = BTreeMap::new();
+            while let Some((index, (string, _))) = futures.try_next().await? {
+                received_strings.insert(index, string);
+            }
+
+            assert_eq!(
+                &strings[..],
+                &received_strings
+                    .values()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+            );
+
             anyhow::Ok(received_things)
         })
         .await??;
@@ -1582,6 +1657,13 @@ async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
 
 impl componentize_js::tests::host_thing_interface::HostHostThingWithStore for HasSelf<Ctx> {
     async fn get<T>(
+        accessor: &Accessor<T, Self>,
+        this: Resource<ThingString>,
+    ) -> anyhow::Result<String> {
+        accessor.with(|mut store| Ok(store.get().table.get(&this)?.0.clone()))
+    }
+
+    async fn get_static<T>(
         accessor: &Accessor<T, Self>,
         this: Resource<ThingString>,
     ) -> anyhow::Result<String> {

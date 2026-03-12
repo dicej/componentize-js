@@ -2725,12 +2725,14 @@ fn imported_resource_from_canon(
         rooted!(&in(cx) let mut object = unsafe {
             mozjs::rust::wrappers2::GetModuleNamespace(cx, module.handle())
         });
-        let proto = get(
+        let class = get(
             cx,
             object.handle(),
             &CString::new(ty.name().to_upper_camel_case()).unwrap(),
         )
         .to_object();
+        rooted!(&in(cx) let class = class);
+        let proto = get(cx, class.handle(), c"prototype").to_object();
         rooted!(&in(cx) let proto = proto);
         unsafe { JS_NewObjectWithGivenProto(cx, ptr::null_mut(), proto.handle()) }
     } else {

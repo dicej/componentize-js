@@ -122,7 +122,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                     .chain(resource.statics.into_iter().map(|index| {
                         let func = &metadata.import_funcs[index];
                         let name = func.name.split_once('.').unwrap().1.to_lower_camel_case();
-                        let code = code(index, true);
+                        let code = code(index, false);
                         format!("static {name}{code}\n")
                     }))
                     .chain(Some(
@@ -282,8 +282,22 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
             .concat(),
     );
 
-    // Next, generate a bit of JS utility code for use with streams.
-    let write_all = "async function(buffer) {
+    // Next, generate a bit of utility code to add to the global object.
+    //
+    // `ComponentError` is used to represent `err` `result` values.  TODO:
+    // ensure `Error` is added to the global object in the runtime so this can
+    // extend it, per
+    // https://github.com/bytecodealliance/jco/blob/bb56a3e2a30cc107c408a84591ef8788e3abbdf5/crates/js-component-bindgen/src/intrinsics/mod.rs#L281-L287
+    //
+    // `_componentizeJsWriteAll` is a utility function for use with streams that
+    // happens to be easier to write in JS than in Rust.
+    let globals = "class ComponentError {
+  constructor(value) {
+    this.payload = value
+  }
+}
+
+var _componentizeJsWriteAll = async function(buffer) {
   let total = 0
   while (buffer.length > 0 && !this.readerDropped) {
     count = await this.write(buffer)
@@ -291,13 +305,14 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
     total += count
   }
   return total
-}";
+}"
+    .to_string();
 
     modules.push(("wit-world".to_string(), world_module));
 
     // Finally, return the result:
     GeneratedCode {
-        globals: format!("var _componentizeJsWriteAll = {write_all}\n"),
+        globals,
         modules,
         script: format!("export const _componentizeJsAsyncExports = {{{async_exports}}}"),
     }
