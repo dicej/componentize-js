@@ -17,10 +17,11 @@ use {
             PrintAndClearException,
         },
         jsapi::{
-            GCTraceKindToAscii, Handle as RawHandle, HandleValueArray, Heap, JS_CallArgsFromVp,
-            JS_GetFunctionObject, JS_HoldPrincipals, JSAutoRealm, JSCLASS_GLOBAL_FLAGS, JSClass,
-            JSClassOps, JSContext as RawJSContext, JSObject, JSTracer, ModuleErrorBehaviour,
-            OnNewGlobalHookOption, PromiseState, SetModuleResolveHook, TraceKind, Value,
+            ExceptionStackBehavior, GCTraceKindToAscii, Handle as RawHandle, HandleValueArray,
+            Heap, JS_CallArgsFromVp, JS_GetFunctionObject, JS_HoldPrincipals, JSAutoRealm,
+            JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSContext as RawJSContext, JSObject,
+            JSTracer, ModuleErrorBehaviour, OnNewGlobalHookOption, PromiseState,
+            SetModuleResolveHook, TraceKind, Value,
         },
         jsval::{
             BigIntValue, BooleanValue, DoubleValue, Int32Value, ObjectValue, StringValue,
@@ -33,12 +34,13 @@ use {
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
                 CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
                 IsPromiseObject, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
-                JS_DeleteProperty1, JS_GetElement, JS_GetProperty,
-                JS_InitDestroyPrincipalsCallback, JS_NewBigInt64Array, JS_NewBigUint64Array,
-                JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewObjectWithGivenProto,
-                JS_NewStringCopyUTF8N, JS_SetElement, JS_SetProperty, ModuleEvaluate, ModuleLink,
-                NewArrayObject, NewArrayObject1, NewPromiseObject, ResolvePromise, RunJobs,
-                ThrowOnModuleEvaluationFailure,
+                JS_ClearPendingException, JS_DeleteProperty1, JS_GetElement,
+                JS_GetPendingException, JS_GetProperty, JS_InitDestroyPrincipalsCallback,
+                JS_IsExceptionPending, JS_NewBigInt64Array, JS_NewBigUint64Array, JS_NewFunction,
+                JS_NewGlobalObject, JS_NewObject, JS_NewObjectWithGivenProto,
+                JS_NewStringCopyUTF8N, JS_SetElement, JS_SetPendingException, JS_SetProperty,
+                ModuleEvaluate, ModuleLink, NewArrayObject, NewArrayObject1, NewPromiseObject,
+                ResolvePromise, RunJobs, ThrowOnModuleEvaluationFailure,
             },
         },
         typedarray::{
@@ -750,6 +752,58 @@ unsafe fn typed_array_data(ty: Type, array: *mut JSObject) -> (*mut u8, usize, L
     }
 }
 
+fn handle_import_result(
+    cx: &mut JSContext,
+    call: &mut MyCall<'_>,
+    ty: Option<Type>,
+) -> Result<Option<Value>, Value> {
+    match ty {
+        Some(Type::Result(ty)) => {
+            rooted!(&in(cx) let wrapper = call.pop().to_object());
+            let tag = unsafe {
+                jsstr_to_string(
+                    cx.raw_cx(),
+                    NonNull::new(get(cx, wrapper.handle(), c"tag").to_string()).unwrap(),
+                )
+            };
+
+            match tag.as_str() {
+                "ok" => Ok(if ty.ok().is_some() {
+                    Some(get(cx, wrapper.handle(), c"val"))
+                } else {
+                    None
+                }),
+                "err" => {
+                    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+                    rooted!(&in(cx) let class = get(cx, global_object.handle(), c"ComponentError"));
+                    let param = if ty.err().is_some() {
+                        get(cx, wrapper.handle(), c"val")
+                    } else {
+                        UndefinedValue()
+                    };
+                    rooted!(&in(cx) let mut result = ptr::null_mut::<JSObject>());
+                    rooted!(&in(cx) let params = vec![param]);
+                    if !unsafe {
+                        Construct1(
+                            cx,
+                            class.handle(),
+                            &HandleValueArray::from(&params),
+                            result.handle_mut(),
+                        )
+                    } {
+                        unsafe { PrintAndClearException(cx.raw_cx()) }
+                        panic!("Construct1 failed")
+                    }
+                    Err(ObjectValue(result.get()))
+                }
+                _ => unreachable!(),
+            }
+        }
+        Some(_) => Ok(Some(call.pop())),
+        None => Ok(None),
+    }
+}
+
 unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert!(argc >= 2);
 
@@ -822,36 +876,92 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
 
         func.call_import_sync(&mut call);
 
-        if func.result().is_some() {
-            args.rval().set(call.pop());
+        match handle_import_result(cx, &mut call, func.result()) {
+            Ok(value) => args.rval().set(value.unwrap_or_else(UndefinedValue)),
+            Err(value) => {
+                rooted!(&in(cx) let exception = value);
+                unsafe {
+                    JS_SetPendingException(
+                        cx,
+                        exception.handle(),
+                        ExceptionStackBehavior::DoNotCapture,
+                    )
+                };
+            }
         }
     }
 
     true
 }
 
+fn handle_export_result(
+    cx: &mut JSContext,
+    call: &mut MyCall<'_>,
+    ty: Option<Type>,
+    value: Handle<'_, Value>,
+    fulfilled: bool,
+) {
+    match ty {
+        Some(Type::Result(ty)) => {
+            rooted!(&in(cx) let mut value = value.get());
+            if !fulfilled {
+                if !value.is_object() {
+                    panic!("caught unexpected exception of non-object type");
+                }
+                rooted!(&in(cx) let object = value.to_object());
+                rooted!(&in(cx) let constructor = get(cx, object.handle(), c"constructor").to_object());
+                let name = &unsafe {
+                    jsstr_to_string(
+                        cx.raw_cx(),
+                        NonNull::new(get(cx, constructor.handle(), c"name").to_string()).unwrap(),
+                    )
+                };
+                if "ComponentError" != name {
+                    panic!("caught unexpected exception; expected `ComponentError`, got `{name}`");
+                }
+                if ty.err().is_some() {
+                    value.set(get(cx, object.handle(), c"payload"));
+                }
+            }
+
+            if (fulfilled && ty.ok().is_some()) || (!fulfilled && ty.err().is_some()) {
+                call.push(value.get());
+            }
+            call.push_result(ty, !fulfilled)
+        }
+        Some(_) => {
+            if !fulfilled {
+                panic!("caught unexpected exception for infallible exported function type");
+            }
+            call.push(value.get());
+        }
+        None => {}
+    }
+}
+
 unsafe extern "C" fn call_task_return(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
-    assert_eq!(argc, 3);
+    assert_eq!(argc, 4);
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
     let index = args.index(0);
     let value = args.index(1);
     let borrows = args.index(2).to_int32();
+    let fulfilled = args.index(3).to_boolean();
     let func = WIT
         .get()
         .unwrap()
         .export_func(usize::try_from(index.to_int32()).unwrap());
     let mut call = MyCall::new();
 
-    if func.result().is_some() {
-        call.push(value.get());
-    }
+    rooted!(&in(cx) let mut value = value.get());
+    handle_export_result(cx, &mut call, func.result(), value.handle(), fulfilled);
 
     func.call_task_return(&mut call);
 
     if borrows != 0 {
         release_borrows(
-            &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) },
+            cx,
             unsafe { Arc::from_raw(borrows as *const Mutex<MyCallTraced>) }.as_ref(),
         );
     }
@@ -1772,9 +1882,19 @@ impl MyInterpreter {
         if async_ {
             poll(cx)
         } else {
-            if func.result().is_some() {
-                call.push(result);
+            rooted!(&in(cx) let mut result = result);
+            let fulfilled = !unsafe { JS_IsExceptionPending(cx) };
+            if !fulfilled {
+                rooted!(&in(cx) let mut exception = UndefinedValue());
+                if !unsafe { JS_GetPendingException(cx, exception.handle_mut()) } {
+                    unsafe { PrintAndClearException(cx.raw_cx()) }
+                    panic!("JS_GetPendingException failed")
+                }
+                unsafe { JS_ClearPendingException(cx) };
+                result.set(exception.get())
             }
+
+            handle_export_result(cx, call, func.result(), result.handle(), fulfilled);
 
             release_borrows(cx, &call.traced);
 
@@ -1843,17 +1963,21 @@ impl Interpreter for MyInterpreter {
                     unsafe { func.lift_import_async_result(call, buffer) };
                     assert!(call.len() < 4);
 
-                    rooted!(&in(cx) let mut result = UndefinedValue());
-                    if func.result().is_some() {
-                        result.set(call.pop());
-                    }
-                    _ = call.pop(); // skip `reject` callback
+                    let result = handle_import_result(cx, call, func.result());
+
+                    rooted!(&in(cx) let reject = call.pop());
                     rooted!(&in(cx) let resolve = call.pop());
-                    rooted!(&in(cx) let params = vec![result.get()]);
+
+                    let (result, resolve_or_reject) = match result {
+                        Ok(value) => (value.unwrap_or_else(UndefinedValue), resolve),
+                        Err(value) => (value, reject),
+                    };
+                    rooted!(&in(cx) let params = vec![result]);
+
                     self::call(
                         cx,
                         Handle::<*mut JSObject>::null(),
-                        resolve.handle(),
+                        resolve_or_reject.handle(),
                         &HandleValueArray::from(&params),
                     );
                 }

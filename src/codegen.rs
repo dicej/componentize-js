@@ -190,7 +190,8 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                         format!(
                             "{name}:function(t{comma}{params}){{\n\
                              return {interface_name}{name}({params})\n\
-                             .then((v)=>_componentizeJsCallTaskReturn({index},v,t))}}"
+                             .then((v)=>_componentizeJsCallTaskReturn({index},v,t,true))\
+                             .catch((v)=>_componentizeJsCallTaskReturn({index},v,t,false))}}"
                         )
                     })
                     .chain(interface.resources.into_iter().map(|(ty, resource)| {
@@ -207,7 +208,8 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                                 format!(
                                     "{name}:function(t{comma}{params}){{\n\
                                      return this.{name}({params})\n\
-                                     .then((v)=>_componentizeJsCallTaskReturn({index},v,t))}}"
+                                     .then((v)=>_componentizeJsCallTaskReturn({index},v,t,true))\
+                                     .catch((v)=>_componentizeJsCallTaskReturn({index},v,t,false))}}"
                                 )
                             })
                             .chain(resource.statics.into_iter().map(|index| {
@@ -219,7 +221,8 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                                 format!(
                                     "{name}:function(t{comma}{params}){{\n\
                                      return {interface_name}{ty}.{name}({params})\n\
-                                     .then((v)=>_componentizeJsCallTaskReturn({index},v,t))}}"
+                                     .then((v)=>_componentizeJsCallTaskReturn({index},v,t,true))\
+                                     .catch((v)=>_componentizeJsCallTaskReturn({index},v,t,false))}}"
                                 )
                             }))
                             .collect::<Vec<_>>()
@@ -291,7 +294,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
     //
     // `_componentizeJsWriteAll` is a utility function for use with streams that
     // happens to be easier to write in JS than in Rust.
-    let globals = "class ComponentError {
+    let globals = "var ComponentError = class {
   constructor(value) {
     this.payload = value
   }
