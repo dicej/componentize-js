@@ -822,8 +822,36 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
 
         func.call_import_sync(&mut call);
 
-        if func.result().is_some() {
-            args.rval().set(call.pop());
+        match func.result() {
+            Some(Type::Result(_)) => {
+                rooted!(&in(cx) let wrapper = call.pop().to_object());
+                let tag = unsafe {
+                    jsstr_to_string(
+                        cx.raw_cx(),
+                        NonNull::new(get(cx, wrapper.handle(), c"tag").to_string()).unwrap(),
+                    )
+                };
+
+                match tag.as_str() {
+                    "ok" => args.rval().set(if ty.ok().is_some() {
+                        get(cx, wrapper.handle(), c"val")
+                    } else {
+                        UndefinedValue()
+                    }),
+                    "err" => {
+                        args.rval().set(UndefinedValue());
+                        tbc(
+                            "construct new ComponentError using Construct1 and then throw it using JS_SetPendingException",
+                            "also, factor the surrounding code out so it can be used in MyInterface::export_async_callback",
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Some(_) => {
+                args.rval().set(call.pop());
+            }
+            None => {}
         }
     }
 
@@ -842,6 +870,11 @@ unsafe extern "C" fn call_task_return(cx: *mut RawJSContext, argc: u32, vp: *mut
         .unwrap()
         .export_func(usize::try_from(index.to_int32()).unwrap());
     let mut call = MyCall::new();
+
+    tbc(
+        "expect flag indicating whether this is being called from a `Promise.then` callback or a `Promise.catch` calback and wrap it in an ok or err result if let Some(Type::Result(_)) = func.result() (checking in the err case that it's of type ComponentError and extracting its payload)",
+        "if there's an unexpected exception, or if it's of an unexpected type, panic",
+    );
 
     if func.result().is_some() {
         call.push(value.get());
@@ -1769,6 +1802,11 @@ impl MyInterpreter {
             )
         };
 
+        tbc(
+            "get and clear pending exception; if it's of type ComponentError, wrap the payload in an err result if let Some(Type::Result(_)) = func.result(), or an ok result if there is no exception",
+            "if there's an unexpected exception, or if it's of an unexpected type, panic",
+        );
+
         if async_ {
             poll(cx)
         } else {
@@ -1847,6 +1885,7 @@ impl Interpreter for MyInterpreter {
                     if func.result().is_some() {
                         result.set(call.pop());
                     }
+                    tbc("use reject callback if we have an err result");
                     _ = call.pop(); // skip `reject` callback
                     rooted!(&in(cx) let resolve = call.pop());
                     rooted!(&in(cx) let params = vec![result.get()]);

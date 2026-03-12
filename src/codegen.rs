@@ -179,6 +179,11 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                         .join(",")
                 };
 
+                tbc(
+                    "emit code that calls `Promise.catch` as well as `Promise.then`, \
+                     passing another param to _componentizeJsCallTaskReturn indicating which one",
+                );
+
                 interface
                     .freestanding
                     .into_iter()
