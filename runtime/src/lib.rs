@@ -14,13 +14,13 @@ use {
         glue::{
             CallObjectTracer, CallValueTracer, CreateRustJSPrincipals, DestroyRustJSPrincipals,
             GetBigInt64ArrayLengthAndData, GetBigUint64ArrayLengthAndData, JSPrincipalsCallbacks,
-            PrintAndClearException,
+            PrintAndClearException, RUST_SYMBOL_TO_JSID,
         },
         jsapi::{
             ExceptionStackBehavior, GCTraceKindToAscii, Handle as RawHandle, HandleValueArray,
             Heap, JS_CallArgsFromVp, JS_GetFunctionObject, JS_HoldPrincipals, JSAutoRealm,
             JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSContext as RawJSContext, JSObject,
-            JSTracer, ModuleErrorBehaviour, OnNewGlobalHookOption, PromiseState,
+            JSTracer, ModuleErrorBehaviour, OnNewGlobalHookOption, PromiseState, PropertyKey,
             SetModuleResolveHook, TraceKind, Value,
         },
         jsval::{
@@ -33,14 +33,14 @@ use {
             wrappers2::{
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
                 CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
-                IsPromiseObject, JS_AddExtraGCRootsTracer, JS_CallFunctionValue,
-                JS_ClearPendingException, JS_DeleteProperty1, JS_GetElement,
+                InitRealmStandardClasses, IsPromiseObject, JS_AddExtraGCRootsTracer,
+                JS_CallFunctionValue, JS_ClearPendingException, JS_DeleteProperty1, JS_GetElement,
                 JS_GetPendingException, JS_GetProperty, JS_InitDestroyPrincipalsCallback,
                 JS_IsExceptionPending, JS_NewBigInt64Array, JS_NewBigUint64Array, JS_NewFunction,
                 JS_NewGlobalObject, JS_NewObject, JS_NewObjectWithGivenProto,
                 JS_NewStringCopyUTF8N, JS_SetElement, JS_SetPendingException, JS_SetProperty,
-                ModuleEvaluate, ModuleLink, NewArrayObject, NewArrayObject1, NewPromiseObject,
-                ResolvePromise, RunJobs, ThrowOnModuleEvaluationFailure,
+                JS_SetPropertyById, ModuleEvaluate, ModuleLink, NewArrayObject, NewArrayObject1,
+                NewPromiseObject, ResolvePromise, RunJobs, ThrowOnModuleEvaluationFailure,
             },
         },
         typedarray::{
@@ -186,6 +186,7 @@ enum Pending {
         call: MyCall<'static>,
         buffer: *mut u8,
         traced: Arc<Mutex<TransmitTraced>>,
+        index: usize,
     },
     FutureWrite {
         _call: MyCall<'static>,
@@ -195,6 +196,7 @@ enum Pending {
         call: MyCall<'static>,
         buffer: *mut u8,
         traced: Arc<Mutex<TransmitTraced>>,
+        index: usize,
     },
 }
 
@@ -401,6 +403,10 @@ fn init_runtime() -> anyhow::Result<()> {
         global_object,
     ));
 
+    if !unsafe { InitRealmStandardClasses(cx) } {
+        bail!("InitRealmStandardClasses failed")
+    }
+
     CONTEXT
         .set(SyncSend(NonNull::new(unsafe { cx.raw_cx() }).unwrap()))
         .map_err(drop)
@@ -442,6 +448,33 @@ fn set(
     if !unsafe { JS_SetProperty(cx, object, name.as_ptr() as *const c_char, value) } {
         unsafe { PrintAndClearException(cx.raw_cx()) }
         panic!("JS_SetProperty failed for `{}`", name.to_str().unwrap())
+    }
+}
+
+// TODO: As of this writing, `mozjs::jsapi::SymbolCode` does not include a
+// `dispose` variant.  Once we upgrade to a version that does, we can remove
+// this, stop using `JS_GetProperty` to get the symbol, and use
+// `GetWellKnownSymbol` instead.
+enum SymbolCode {
+    Dispose,
+}
+
+fn set_with_symbol(
+    cx: &mut JSContext,
+    object: Handle<'_, *mut JSObject>,
+    code: SymbolCode,
+    value: Handle<'_, Value>,
+) {
+    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+    let name = match code {
+        SymbolCode::Dispose => c"_componentizeJsSymbolDispose",
+    };
+    rooted!(&in(cx) let symbol = get(cx, global_object.handle(), name).to_symbol());
+    rooted!(&in(cx) let mut key = PropertyKey::default());
+    unsafe { RUST_SYMBOL_TO_JSID(symbol.get(), key.handle_mut().into()) }
+    if !unsafe { JS_SetPropertyById(cx, object, key.handle(), value) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("JS_SetPropertyById failed for `{}`", name.to_str().unwrap())
     }
 }
 
@@ -1145,9 +1178,9 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
     rooted!(&in(cx) let this = args.thisv().to_object());
-    let index = get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32;
+    let index = usize::try_from(get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32).unwrap();
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
-    let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
+    let ty = WIT.get().unwrap().stream(index);
 
     let max_count = usize::try_from(args.index(0).to_int32() as u32).unwrap();
     let layout =
@@ -1178,6 +1211,7 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
                 call,
                 buffer,
                 traced: TransmitTraced::new(this.get(), promise.get(), None),
+                index,
             },
         );
     } else {
@@ -1262,13 +1296,12 @@ unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     rooted!(&in(cx) let tx_handle = UInt32Value(tx_handle));
     set(cx, tx.handle(), HANDLE_FIELD_NAME, tx_handle.handle());
 
-    for (name, func) in [
-        (c"write", stream_write as JsFunction),
-        (c"drop", stream_drop_writable as JsFunction),
-    ] {
-        rooted!(&in(cx) let mut func = wrap(cx, func));
-        set(cx, tx.handle(), name, func.handle());
-    }
+    rooted!(&in(cx) let mut func = wrap(cx, stream_write));
+    set(cx, tx.handle(), c"write", func.handle());
+
+    rooted!(&in(cx) let mut func = wrap(cx, stream_drop_writable));
+    set_with_symbol(cx, tx.handle(), SymbolCode::Dispose, func.handle());
+
     rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
     rooted!(&in(cx) let write_all = get(cx, global_object.handle(), c"_componentizeJsWriteAll"));
     set(cx, tx.handle(), c"writeAll", write_all.handle());
@@ -1280,13 +1313,11 @@ unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     rooted!(&in(cx) let rx_handle = UInt32Value(rx_handle));
     set(cx, rx.handle(), HANDLE_FIELD_NAME, rx_handle.handle());
 
-    for (name, func) in [
-        (c"read", stream_read as JsFunction),
-        (c"drop", stream_drop_readable as JsFunction),
-    ] {
-        rooted!(&in(cx) let mut func = wrap(cx, func));
-        set(cx, rx.handle(), name, func.handle());
-    }
+    rooted!(&in(cx) let mut func = wrap(cx, stream_read));
+    set(cx, rx.handle(), c"read", func.handle());
+
+    rooted!(&in(cx) let mut func = wrap(cx, stream_drop_readable));
+    set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
 
     rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
     args.rval().set(ObjectValue(unsafe {
@@ -1306,6 +1337,12 @@ unsafe extern "C" fn future_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     rooted!(&in(cx) let this = args.thisv().to_object());
     let index = get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32;
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
+
+    // TODO: will need to restore these on cancellation once that's supported:
+    for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
+        delete(cx, this.handle(), name);
+    }
+
     let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
 
     let layout = Layout::from_size_align(ty.abi_payload_size(), ty.abi_payload_align()).unwrap();
@@ -1354,13 +1391,12 @@ unsafe extern "C" fn future_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     } else {
         let code = code & 0xF;
 
-        if code == RETURN_CODE_DROPPED {
-            restore_resources(cx, &traced, 0);
-        }
-
         let result = match code {
             self::RETURN_CODE_COMPLETED => true,
-            self::RETURN_CODE_DROPPED => false,
+            self::RETURN_CODE_DROPPED => {
+                restore_resources(cx, &traced, 0);
+                false
+            }
             self::RETURN_CODE_CANCELLED => todo!(),
             _ => unreachable!(),
         };
@@ -1410,9 +1446,15 @@ unsafe extern "C" fn future_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
     rooted!(&in(cx) let this = args.thisv().to_object());
-    let index = get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32;
+    let index = usize::try_from(get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32).unwrap();
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
-    let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
+
+    // TODO: will need to restore these on cancellation once that's supported:
+    for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
+        delete(cx, this.handle(), name);
+    }
+
+    let ty = WIT.get().unwrap().future(index);
 
     let layout = Layout::from_size_align(ty.abi_payload_size(), ty.abi_payload_align()).unwrap();
     let buffer = unsafe { std::alloc::alloc(layout) };
@@ -1441,6 +1483,7 @@ unsafe extern "C" fn future_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
                 call,
                 buffer,
                 traced: TransmitTraced::new(this.get(), promise.get(), None),
+                index,
             },
         );
     } else {
@@ -1509,13 +1552,11 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     rooted!(&in(cx) let tx_handle = UInt32Value(tx_handle));
     set(cx, tx.handle(), HANDLE_FIELD_NAME, tx_handle.handle());
 
-    for (name, func) in [
-        (c"write", future_write as JsFunction),
-        (c"drop", future_drop_writable as JsFunction),
-    ] {
-        rooted!(&in(cx) let mut func = wrap(cx, func));
-        set(cx, tx.handle(), name, func.handle());
-    }
+    rooted!(&in(cx) let mut func = wrap(cx, future_write));
+    set(cx, tx.handle(), c"write", func.handle());
+
+    rooted!(&in(cx) let mut func = wrap(cx, future_drop_writable));
+    set_with_symbol(cx, tx.handle(), SymbolCode::Dispose, func.handle());
 
     rooted!(&in(cx) let rx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
     set(cx, rx.handle(), TYPE_FIELD_NAME, unsafe {
@@ -1524,13 +1565,11 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     rooted!(&in(cx) let rx_handle = UInt32Value(rx_handle));
     set(cx, rx.handle(), HANDLE_FIELD_NAME, rx_handle.handle());
 
-    for (name, func) in [
-        (c"read", future_read as JsFunction),
-        (c"drop", future_drop_readable as JsFunction),
-    ] {
-        rooted!(&in(cx) let mut func = wrap(cx, func));
-        set(cx, rx.handle(), name, func.handle());
-    }
+    rooted!(&in(cx) let mut func = wrap(cx, future_read));
+    set(cx, rx.handle(), c"read", func.handle());
+
+    rooted!(&in(cx) let mut func = wrap(cx, future_drop_readable));
+    set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
 
     rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
     args.rval().set(ObjectValue(unsafe {
@@ -2029,10 +2068,11 @@ impl Interpreter for MyInterpreter {
                     .remove(&event1)
                     .unwrap();
 
-                let Pending::StreamRead {
-                    traced,
+                let &mut Pending::StreamRead {
+                    ref traced,
                     buffer,
-                    call,
+                    ref mut call,
+                    index,
                     ..
                 } = pending
                 else {
@@ -2042,11 +2082,7 @@ impl Interpreter for MyInterpreter {
                 rooted!(&in(cx) let stream = traced.try_lock().unwrap().wrapper.get());
                 rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
 
-                let index = get(cx, stream.handle(), TYPE_FIELD_NAME);
-                let ty = WIT
-                    .get()
-                    .unwrap()
-                    .stream(usize::try_from(index.to_int32() as u32).unwrap());
+                let ty = WIT.get().unwrap().stream(index);
 
                 let count = usize::try_from(event2 >> 4).unwrap();
                 let code = event2 & 0xF;
@@ -2059,7 +2095,7 @@ impl Interpreter for MyInterpreter {
                 assert!(traced.try_lock().unwrap().resources.is_none());
 
                 if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
-                    rooted!(&in(cx) let value = unsafe { create_typed_array(cx, ty, *buffer, count) });
+                    rooted!(&in(cx) let value = unsafe { create_typed_array(cx, ty, buffer, count) });
                     resolve(cx, promise.handle(), value.handle());
                 } else {
                     rooted!(&in(cx) let array = unsafe { NewArrayObject1(cx, count) });
@@ -2128,6 +2164,7 @@ impl Interpreter for MyInterpreter {
                     ref traced,
                     buffer,
                     ref mut call,
+                    index,
                     ..
                 } = pending
                 else {
@@ -2139,11 +2176,7 @@ impl Interpreter for MyInterpreter {
                 rooted!(&in(cx) let future = traced.try_lock().unwrap().wrapper.get());
                 rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
 
-                let index = get(cx, future.handle(), TYPE_FIELD_NAME);
-                let ty = WIT
-                    .get()
-                    .unwrap()
-                    .future(usize::try_from(index.to_int32() as u32).unwrap());
+                let ty = WIT.get().unwrap().future(index);
 
                 let code = event2 & 0xF;
                 match code {
@@ -2717,13 +2750,13 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         let stream = imported_resource_from_canon(cx, ty.index(), handle, None);
         rooted!(&in(cx) let rx = stream);
-        for (name, func) in [
-            (c"read", future_read as JsFunction),
-            (c"drop", future_drop_readable as JsFunction),
-        ] {
-            rooted!(&in(cx) let mut func = wrap(cx, func));
-            set(cx, rx.handle(), name, func.handle());
-        }
+
+        rooted!(&in(cx) let mut func = wrap(cx, future_read));
+        set(cx, rx.handle(), c"read", func.handle());
+
+        rooted!(&in(cx) let mut func = wrap(cx, future_drop_readable));
+        set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
+
         self.push(ObjectValue(rx.get()))
     }
 
@@ -2731,13 +2764,13 @@ impl Call for MyCall<'_> {
         let cx = &mut context();
         let stream = imported_resource_from_canon(cx, ty.index(), handle, None);
         rooted!(&in(cx) let rx = stream);
-        for (name, func) in [
-            (c"read", stream_read as JsFunction),
-            (c"drop", stream_drop_readable as JsFunction),
-        ] {
-            rooted!(&in(cx) let mut func = wrap(cx, func));
-            set(cx, rx.handle(), name, func.handle());
-        }
+
+        rooted!(&in(cx) let mut func = wrap(cx, stream_read));
+        set(cx, rx.handle(), c"read", func.handle());
+
+        rooted!(&in(cx) let mut func = wrap(cx, stream_drop_readable));
+        set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
+
         self.push(ObjectValue(rx.get()))
     }
 

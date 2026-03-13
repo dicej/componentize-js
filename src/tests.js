@@ -4,18 +4,33 @@ import * as simpleAsyncImportAndExport from "componentize-js:tests/simple-async-
 import * as hostThingInterface from "componentize-js:tests/host-thing-interface"
 import * as witWorld from "wit-world"
 
+// TODO: As of this writing, the version of SpiderMonkey `mozjs` uses (140.x) is
+// just barely too old to support `using` declarations.  Once we've upgraded, we
+// should update the following code to use them instead of calling
+// `_componentizeJsSymbolDispose` functions directly.
+
 async function pipeBytes(rx, tx) {
     while (!(rx.writerDropped || tx.readerDropped)) {
         await tx.writeAll(await rx.read(1024))
     }
-    tx.drop()
+
+    tx[_componentizeJsSymbolDispose]()
+    rx[_componentizeJsSymbolDispose]()
 }
 
 async function pipeStrings(rx, tx) {
+    // TODO: The version of SpiderMonkey we're using doesn't appear to support
+    // the `using` syntax, otherwise we would use it here.
     await tx.write(await rx.read())
+
+    tx[_componentizeJsSymbolDispose]()
+    rx[_componentizeJsSymbolDispose]()
 }
 
 async function pipeThings(rx, tx, class_) {
+    // TODO: The version of SpiderMonkey we're using doesn't appear to support
+    // the `using` syntax, otherwise we would use it here.
+
     // Read the things one at a time, forcing the host to re-take ownership of
     // any unwritten items between writes.
     let things = []
@@ -47,10 +62,15 @@ async function pipeThings(rx, tx, class_) {
     // Write the things all at once.  The host will read them only one at a time,
     // forcing us to re-take ownership of any unwritten items between writes.
     await tx.writeAll(things)
-    tx.drop()
+
+    tx[_componentizeJsSymbolDispose]()
+    rx[_componentizeJsSymbolDispose]()
 }
 
 async function writeThing(thing, tx1, tx2) {
+    // TODO: The version of SpiderMonkey we're using doesn't appear to support
+    // the `using` syntax, otherwise we would use it here.
+
     // The host will drop the first reader without reading, which should give us
     // back ownership of `thing`.
     let wrote = await tx1.write(thing)
@@ -62,6 +82,10 @@ async function writeThing(thing, tx1, tx2) {
     if (!wrote) {
         throw Error()
     }
+
+    thing[_componentizeJsSymbolDispose]()
+    tx1[_componentizeJsSymbolDispose]()
+    tx2[_componentizeJsSymbolDispose]()
 }
 
 export const componentizeJsTestsSimpleExport = {
@@ -232,6 +256,7 @@ class Thing {
         }
         return v.value
     }
+    [_componentizeJsSymbolDispose]() {}
 }
 
 export const componentizeJsTestsStreamsAndFutures = {

@@ -126,7 +126,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                         format!("static {name}{code}\n")
                     }))
                     .chain(Some(
-                        "drop(){{_componentizeJsDropResource.call(this)}}".to_string(),
+                        "[_componentizeJsSymbolDispose](){{_componentizeJsDropResource.call(this)}}".to_string(),
                     ))
                     .collect::<Vec<_>>()
                     .concat();
@@ -287,16 +287,19 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
 
     // Next, generate a bit of utility code to add to the global object.
     //
-    // `ComponentError` is used to represent `err` `result` values.  TODO:
-    // ensure `Error` is added to the global object in the runtime so this can
-    // extend it, per
+    // `ComponentError` is used to represent `err` `result` values.  Shamelessly
+    // stolen from
     // https://github.com/bytecodealliance/jco/blob/bb56a3e2a30cc107c408a84591ef8788e3abbdf5/crates/js-component-bindgen/src/intrinsics/mod.rs#L281-L287
     //
     // `_componentizeJsWriteAll` is a utility function for use with streams that
     // happens to be easier to write in JS than in Rust.
-    let globals = "var ComponentError = class {
-  constructor(value) {
-    this.payload = value
+    let globals = "var _componentizeJsSymbolDispose = Symbol.dispose || Symbol.for('dispose')
+
+var ComponentError = class extends Error {
+  constructor (value) {
+    const enumerable = typeof value !== 'string';
+    super(enumerable ? `${String(value)} (see error.payload)` : value);
+    Object.defineProperty(this, 'payload', { value, enumerable });
   }
 }
 
