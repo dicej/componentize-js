@@ -1,4 +1,4 @@
-# Example: `cli-p3`
+# Example: `cli`
 
 This is an example of how to use [componentize-js] and [Wasmtime] to build and
 run a Python-based component targetting version `0.3.0-rc-2026-01-06` of the
@@ -10,12 +10,10 @@ run a Python-based component targetting version `0.3.0-rc-2026-01-06` of the
 
 ## Prerequisites
 
+* [Rust](https://rustup.rs/)
 * `Wasmtime` 41.0.3
-* `componentize-py` 0.21.0
-
-Below, we use [Rust](https://rustup.rs/)'s `cargo` to install `Wasmtime`.  If
-you don't have `cargo`, you can download and install from
-https://github.com/bytecodealliance/wasmtime/releases/tag/v41.0.3.
+* `componentize-js`
+* a clone of the `componentize-js` repository
 
 ```
 cargo install --version 41.0.3 wasmtime-cli
