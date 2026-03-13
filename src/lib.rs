@@ -3,18 +3,26 @@
 use {
     anyhow::{Context as _, anyhow},
     bytes::Bytes,
-    std::{borrow::Cow, io::Cursor},
+    indexmap::IndexSet,
+    std::{
+        borrow::Cow,
+        collections::HashMap,
+        io::Cursor,
+        path::{Path, PathBuf},
+    },
     wasm_encoder::{CustomSection, Section as _},
     wasmtime::{
         Config, Engine, Store,
-        component::{Component, Linker, ResourceTable},
+        component::{Component, Linker, ResourceTable, ResourceType},
     },
     wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView},
     wasmtime_wizer::{WasmtimeWizerComponent, Wizer},
     wit_component::metadata,
     wit_dylib::DylibOpts,
-    wit_parser::Resolve,
+    wit_parser::{
+        FunctionKind, Resolve, TypeDefKind, UnresolvedPackageGroup, WorldId, WorldItem, WorldKey,
+    },
 };
 
 wasmtime::component::bindgen!({
@@ -24,6 +32,7 @@ wasmtime::component::bindgen!({
 });
 
 mod codegen;
+pub mod command;
 #[cfg(test)]
 mod tests;
 
@@ -41,15 +50,51 @@ impl WasiView for Ctx {
     }
 }
 
+pub enum Wit<'a, P = PathBuf> {
+    String(&'a str),
+    Paths(&'a [P]),
+}
+
 #[expect(clippy::type_complexity)]
 pub async fn componentize(
-    wit: &str,
+    wit: Wit<'_, impl AsRef<Path>>,
     world: Option<&str>,
+    features: &[String],
+    all_features: bool,
     js: &str,
     add_to_linker: Option<&dyn Fn(&mut Linker<Ctx>) -> anyhow::Result<()>>,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut resolve = Resolve::default();
-    let package = resolve.push_str("wit", wit)?;
+    let mut resolve = Resolve {
+        all_features,
+        ..Default::default()
+    };
+
+    for features in features {
+        for feature in features
+            .split(',')
+            .flat_map(|s| s.split_whitespace())
+            .filter(|f| !f.is_empty())
+        {
+            resolve.features.insert(feature.to_string());
+        }
+    }
+
+    let package = match wit {
+        Wit::String(wit) => resolve.push_str("wit", wit)?,
+        Wit::Paths(paths) => {
+            let mut last_pkg = None;
+            for path in paths.iter().map(AsRef::as_ref) {
+                let pkg = if path.is_dir() {
+                    resolve.push_dir(path)?.0
+                } else {
+                    let pkg = UnresolvedPackageGroup::parse_file(path)?;
+                    resolve.push_group(pkg)?
+                };
+                last_pkg = Some(pkg);
+            }
+            last_pkg.unwrap() // The paths should not be empty
+        }
+    };
     let world = resolve.select_world(&[package], world)?;
 
     let (mut bindings, metadata) = wit_dylib::create_with_metadata(
@@ -148,7 +193,7 @@ pub async fn componentize(
     if let Some(add_to_linker) = add_to_linker {
         add_to_linker(&mut linker)?;
     } else {
-        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+        add_wasi_and_stubs(&resolve, &[world].into_iter().collect(), &mut linker)?;
     }
 
     let instance = linker.instantiate_async(&mut store, &component).await?;
@@ -161,8 +206,8 @@ pub async fn componentize(
                 &generated_code.modules,
                 js,
             )
-            .await?
-            .map_err(|e| anyhow!("{e}"))
+            .await
+            .and_then(|v| v.map_err(|e| anyhow!("{e}")))
             .with_context(move || {
                 format!(
                     "{}{}",
@@ -181,4 +226,160 @@ pub async fn componentize(
             },
         )
         .await
+}
+
+// Stolen from https://github.com/bytecodealliance/componentize-py/blob/89af297898960efc48575d4c166d03b399568269/src/lib.rs#L761-L911
+//
+// TODO: deduplicate this so that `componentize-py` and this project can share
+// it.
+fn add_wasi_and_stubs(
+    resolve: &Resolve,
+    worlds: &IndexSet<WorldId>,
+    linker: &mut Linker<Ctx>,
+) -> anyhow::Result<()> {
+    wasmtime_wasi::p2::add_to_linker_async(linker)?;
+
+    enum Stub<'a> {
+        Function(&'a String, &'a FunctionKind),
+        Resource(&'a String),
+    }
+
+    let mut stubs = HashMap::<_, Vec<_>>::new();
+    for &world in worlds {
+        for (key, item) in &resolve.worlds[world].imports {
+            match item {
+                WorldItem::Interface { id, .. } => {
+                    let interface_name = match key {
+                        WorldKey::Name(name) => name.clone(),
+                        WorldKey::Interface(interface) => resolve.id_of(*interface).unwrap(),
+                    };
+
+                    let interface = &resolve.interfaces[*id];
+                    for (function_name, function) in &interface.functions {
+                        stubs
+                            .entry(Some(interface_name.clone()))
+                            .or_default()
+                            .push(Stub::Function(function_name, &function.kind));
+                    }
+
+                    for (type_name, id) in interface.types.iter() {
+                        if let TypeDefKind::Resource = &resolve.types[*id].kind {
+                            stubs
+                                .entry(Some(interface_name.clone()))
+                                .or_default()
+                                .push(Stub::Resource(type_name));
+                        }
+                    }
+                }
+                WorldItem::Function(function) => {
+                    stubs
+                        .entry(None)
+                        .or_default()
+                        .push(Stub::Function(&function.name, &function.kind));
+                }
+                WorldItem::Type { id, .. } => {
+                    let ty = &resolve.types[*id];
+                    if let TypeDefKind::Resource = &ty.kind {
+                        stubs
+                            .entry(None)
+                            .or_default()
+                            .push(Stub::Resource(ty.name.as_ref().unwrap()));
+                    }
+                }
+            }
+        }
+    }
+
+    for (interface_name, stubs) in stubs {
+        if let Some(interface_name) = interface_name {
+            // Note that we do _not_ stub interfaces which appear to be part of
+            // WASIp2 since those should be provided by the
+            // `wasmtime_wasi::add_to_linker_async` call above, and adding stubs
+            // to those same interfaces would just cause trouble.
+            if !is_wasip2_cli(&interface_name)
+                && let Ok(mut instance) = linker.instance(&interface_name)
+            {
+                for stub in stubs {
+                    let interface_name = interface_name.clone();
+                    match stub {
+                        Stub::Function(name, kind) => {
+                            if kind.is_async() {
+                                instance.func_new_concurrent(name, {
+                                    let name = name.clone();
+                                    move |_, _, _, _| {
+                                        let interface_name = interface_name.clone();
+                                        let name = name.clone();
+                                        Box::pin(async move {
+                                            Err(anyhow!(
+                                                "called trapping stub: {interface_name}#{name}"
+                                            ))
+                                        })
+                                    }
+                                })
+                            } else {
+                                instance.func_new(name, {
+                                    let name = name.clone();
+                                    move |_, _, _, _| {
+                                        Err(anyhow!(
+                                            "called trapping stub: {interface_name}#{name}"
+                                        ))
+                                    }
+                                })
+                            }
+                        }
+                        Stub::Resource(name) => instance
+                            .resource(name, ResourceType::host::<()>(), {
+                                let name = name.clone();
+                                move |_, _| {
+                                    Err(anyhow!("called trapping stub: {interface_name}#{name}"))
+                                }
+                            })
+                            .map(drop),
+                    }?;
+                }
+            }
+        } else {
+            let mut instance = linker.root();
+            for stub in stubs {
+                match stub {
+                    Stub::Function(name, kind) => {
+                        if kind.is_async() {
+                            instance.func_new_concurrent(name, {
+                                let name = name.clone();
+                                move |_, _, _, _| {
+                                    let name = name.clone();
+                                    Box::pin(
+                                        async move { Err(anyhow!("called trapping stub: {name}")) },
+                                    )
+                                }
+                            })
+                        } else {
+                            instance.func_new(name, {
+                                let name = name.clone();
+                                move |_, _, _, _| Err(anyhow!("called trapping stub: {name}"))
+                            })
+                        }
+                    }
+                    Stub::Resource(name) => instance
+                        .resource(name, ResourceType::host::<()>(), {
+                            let name = name.clone();
+                            move |_, _| Err(anyhow!("called trapping stub: {name}"))
+                        })
+                        .map(drop),
+                }?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_wasip2_cli(interface_name: &str) -> bool {
+    (interface_name.starts_with("wasi:cli/")
+        || interface_name.starts_with("wasi:clocks/")
+        || interface_name.starts_with("wasi:random/")
+        || interface_name.starts_with("wasi:io/")
+        || interface_name.starts_with("wasi:filesystem/")
+        || interface_name.starts_with("wasi:sockets/"))
+        && interface_name.contains("@0.2.")
 }

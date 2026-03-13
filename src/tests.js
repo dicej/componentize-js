@@ -5,8 +5,9 @@ import * as hostThingInterface from "componentize-js:tests/host-thing-interface"
 import * as witWorld from "wit-world"
 
 // TODO: As of this writing, the version of SpiderMonkey `mozjs` uses (140.x) is
-// just barely too old to support `using` declarations.  Once we've upgraded, we
-// should update the following code to use them instead of calling
+// just barely too old to support explicit resource mangement (e.g. `using`
+// declarations and `Symbol.dispose`).  Once we've upgraded, we should update
+// the following code to use them instead of calling
 // `_componentizeJsSymbolDispose` functions directly.
 
 async function pipeBytes(rx, tx) {

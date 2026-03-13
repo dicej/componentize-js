@@ -20,6 +20,9 @@ wit-dylib = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
 wit-parser = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
 zstd = "0.13.3"
 heck = "0.5.0"
+clap = { version = "4.6.0", features = ["derive"] }
+clap_derive = "4.6.0"
+indexmap = "2.13.0"
 
 [workspace]
 members = ["runtime"]
@@ -36,3 +39,4 @@ futures = "0.3.32"
 hex = "0.4.3"
 proptest = "1.10.0"
 rand = "0.10.0"
+wasmtime-wasi = { git = "https://github.com/dicej/wasmtime", rev = "4856b557", features = ["p3"] }

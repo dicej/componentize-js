@@ -296,11 +296,21 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
     let globals = "var _componentizeJsSymbolDispose = Symbol.dispose || Symbol.for('dispose')
 
 var ComponentError = class extends Error {
-  constructor (value) {
+  constructor(value) {
     const enumerable = typeof value !== 'string';
     super(enumerable ? `${String(value)} (see error.payload)` : value);
     Object.defineProperty(this, 'payload', { value, enumerable });
   }
+}
+
+var TextEncoder = class {
+  constructor() {}
+  encode(value) { return _componentizeJsEncodeUtf8(value) }
+}
+
+var TextDecoder = class {
+  constructor() {}
+  decode(value) { return _componentizeJsDecodeUtf8(value) }
 }
 
 var _componentizeJsWriteAll = async function(buffer) {

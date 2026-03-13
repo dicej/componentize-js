@@ -1,5 +1,5 @@
 use {
-    super::Ctx,
+    crate::{Ctx, Wit},
     componentize_js::tests::echoes::{EnumType, FlagsType, RecordType, ResourceType, VariantType},
     exports::componentize_js::tests::streams_and_futures,
     futures::{FutureExt as _, TryStreamExt as _, stream::FuturesUnordered},
@@ -62,8 +62,10 @@ async fn pre() -> &'static TestsPre<Ctx> {
             linker.instantiate_pre(&Component::new(
                 &ENGINE,
                 crate::componentize(
-                    include_str!("tests.wit"),
+                    Wit::<String>::String(include_str!("tests.wit")),
                     None,
+                    &[],
+                    false,
                     include_str!("tests.js"),
                     Some(&add_to_linker),
                 )

@@ -29,7 +29,7 @@ use {
         },
         rooted,
         rust::{
-            self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime,
+            self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime, ToString,
             wrappers2::{
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
                 CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
@@ -950,7 +950,15 @@ fn handle_export_result(
                     )
                 };
                 if "ComponentError" != name {
-                    panic!("caught unexpected exception; expected `ComponentError`, got `{name}`");
+                    let string = unsafe {
+                        jsstr_to_string(
+                            cx.raw_cx(),
+                            NonNull::new(ToString(cx.raw_cx(), value.handle())).unwrap(),
+                        )
+                    };
+                    panic!(
+                        "caught unexpected exception; expected `ComponentError`, got `{string}`"
+                    );
                 }
                 if ty.err().is_some() {
                     value.set(get(cx, object.handle(), c"payload"));
@@ -1579,6 +1587,51 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     true
 }
 
+unsafe extern "C" fn encode_utf8(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+
+    let string = unsafe {
+        jsstr_to_string(
+            cx.raw_cx(),
+            NonNull::new(args.index(0).to_string()).unwrap(),
+        )
+    };
+
+    rooted!(&in(cx) let mut array = ptr::null_mut::<JSObject>());
+    unsafe {
+        Uint8Array::create(
+            cx.raw_cx(),
+            CreateWith::Slice(string.as_bytes()),
+            array.handle_mut(),
+        )
+        .unwrap()
+    }
+    args.rval().set(ObjectValue(array.get()));
+
+    true
+}
+
+unsafe extern "C" fn decode_utf8(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
+    assert_eq!(argc, 1);
+
+    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
+    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
+    let (data, length) = unsafe { Uint8::length_and_data(args.index(0).to_object()) };
+
+    let string = str::from_utf8(unsafe { slice::from_raw_parts(data, length) })
+        .unwrap()
+        .to_string();
+
+    args.rval().set(StringValue(unsafe {
+        &*JS_NewStringCopyUTF8N(cx, &*Utf8Chars::from(string.as_str()))
+    }));
+
+    true
+}
+
 unsafe extern "C" fn resolve_import(
     cx: *mut RawJSContext,
     _: RawHandle<Value>,
@@ -1671,6 +1724,8 @@ fn init(globals: &str, modules: &[(&str, &str)], script: &str) -> anyhow::Result
         (c"_componentizeJsLog", log as JsFunction),
         (c"_componentizeJsMakeStream", make_stream as JsFunction),
         (c"_componentizeJsMakeFuture", make_future as JsFunction),
+        (c"_componentizeJsEncodeUtf8", encode_utf8 as JsFunction),
+        (c"_componentizeJsDecodeUtf8", decode_utf8 as JsFunction),
     ] {
         rooted!(&in(cx) let mut func = wrap(cx, func));
         rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });

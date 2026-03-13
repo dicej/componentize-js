@@ -29,15 +29,16 @@ and possibly at a higher level of abstraction outside of this crate.
 - [x] support arbitrary WIT types
 - [x] add a license (Apache 2 + LLVM exception)
 - [x] move JS code generation out of guest code to minimize snapshot bloat
-- [ ] run linting and tests in CI
-- [ ] add a CLI interface
-- [ ] make codegen match existing `ComponentizeJS` output
-- [ ] generate (and validate in CI) TypeScript bindings (can probably use existing `ComponentizeJS` code)
-- [ ] resource/stream/future disposal using [`Symbol.dispose`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/dispose)
+- [x] make codegen match existing `ComponentizeJS` output
+- [x] resource/stream/future disposal using [`Symbol.dispose`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/dispose)
+- [x] add a CLI interface
+- [x] add example(s)
+- [ ] resource/stream/future finalization
+- [ ] integrate with StarlingMonkey for Web and Node API support
+- [ ] lint and run tests (including examples) in CI
+- [ ] generate (and validate in CI) TypeScript bindings (possibly reuse existing `ComponentizeJS` code)
 - [ ] make streams (and futures?) more idiomatic (e.g. `ReadableStream` and `WritableStream`)
-- [ ] integrate with (parts of) Servo and StarlingMonkey for WinterCG support
-- [ ] add examples and lint and test them in CI (cf. the [`componentize-py` examples](https://github.com/bytecodealliance/componentize-py/tree/main/examples))
-- [ ] investigate options (e.g. GC pinning?) for zero-copy `stream<u8>` reads and writes
+- [ ] investigate options (e.g. GC pinning?) for zero-copy `ArrayBuffer` reads and writes
 
 ## Building and Running
 
@@ -70,8 +71,11 @@ export WASI_SDK_PATH=$(pwd)/wasi-sdk-30.0-arm64-linux
 
 > Note: on Ubuntu 24.04, you may need to `apt install libclang-20-dev` as well.
 
-Finally, build and run the tests (CLI interface coming soon!):
+Finally, build and run:
 
 ```shell
-cargo test --release
+cargo run --release -- --help
 ```
+
+See the [examples](./examples) folder for examples of how to create and run
+components.
