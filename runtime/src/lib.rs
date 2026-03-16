@@ -53,6 +53,7 @@ use {
         alloc::{self, Layout},
         collections::{HashMap, HashSet},
         ffi::{CStr, CString, c_char, c_void},
+        fs,
         hash::{BuildHasherDefault, DefaultHasher, Hash, Hasher},
         marker::PhantomData,
         mem,
@@ -1646,7 +1647,7 @@ unsafe extern "C" fn resolve_import(
         )
     };
 
-    let module = MODULES
+    let mut module = MODULES
         .try_lock()
         .unwrap()
         .0
@@ -1655,7 +1656,29 @@ unsafe extern "C" fn resolve_import(
         .unwrap_or_else(ptr::null_mut);
 
     if module.is_null() {
-        panic!("unable to resolve import `{specifier}`");
+        // Try loading it from the filesystem
+        if let Ok(script) = fs::read_to_string(&specifier) {
+            let compile_options =
+                CompileOptionsWrapper::new(cx, CString::new(specifier.as_str()).unwrap(), 1);
+            module = unsafe {
+                CompileModule1(
+                    cx,
+                    compile_options.ptr,
+                    &mut rust::transform_str_to_source_text(&script),
+                )
+            };
+            if module.is_null() {
+                unsafe { PrintAndClearException(cx.raw_cx()) }
+                panic!("CompileModule1 failed")
+            }
+            MODULES
+                .try_lock()
+                .unwrap()
+                .0
+                .insert(specifier, Heap::boxed(module));
+        } else {
+            panic!("unable to resolve import `{specifier}`");
+        }
     }
 
     module

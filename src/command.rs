@@ -59,6 +59,11 @@ pub struct Componentize {
     /// The filename of a JavaScript module from which to generate a component.
     pub input: PathBuf,
 
+    /// Specify a directory containing any modules on which the input script
+    /// depends.
+    #[arg(short = 'p', long, default_value = ".")]
+    pub base_directory: PathBuf,
+
     /// Output file to which to write the resulting component
     #[arg(short = 'o', long, default_value = "js.wasm")]
     pub output: PathBuf,
@@ -81,6 +86,7 @@ fn componentize(common: Common, componentize: Componentize) -> anyhow::Result<()
         &common.features,
         common.all_features,
         &input,
+        Some(&componentize.base_directory),
         None,
     ))?;
 

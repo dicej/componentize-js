@@ -1,7 +1,7 @@
 # Example: `cli`
 
 This is an example of how to use [componentize-js] and [Wasmtime] to build and
-run a Python-based component targetting version `0.3.0-rc-2026-01-06` of the
+run a JS-based component targetting version `0.3.0-rc-2026-01-06` of the
 [wasi-cli] `command` world.
 
 [componentize-js]: https://github.com/dicej/componentize-js
@@ -14,6 +14,9 @@ run a Python-based component targetting version `0.3.0-rc-2026-01-06` of the
 * `Wasmtime` 41.0.3
 * `componentize-js`
 * a clone of the `componentize-js` repository
+
+Once you have Rust, you can install `Wasmtime` and `componentize-js` using
+`cargo install`:
 
 ```
 cargo install --version 41.0.3 wasmtime-cli

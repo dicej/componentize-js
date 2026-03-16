@@ -4,6 +4,7 @@ use {
     wit_dylib::metadata::{Metadata, Type},
 };
 
+#[derive(Debug)]
 pub struct GeneratedCode {
     pub globals: String,
     pub modules: Vec<(String, String)>,

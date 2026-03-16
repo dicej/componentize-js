@@ -67,6 +67,7 @@ async fn pre() -> &'static TestsPre<Ctx> {
                     &[],
                     false,
                     include_str!("tests.js"),
+                    None::<String>,
                     Some(&add_to_linker),
                 )
                 .await?,

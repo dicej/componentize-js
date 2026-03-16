@@ -16,7 +16,7 @@ use {
         component::{Component, Linker, ResourceTable, ResourceType},
     },
     wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
-    wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView},
+    wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView},
     wasmtime_wizer::{WasmtimeWizerComponent, Wizer},
     wit_component::metadata,
     wit_dylib::DylibOpts,
@@ -62,6 +62,7 @@ pub async fn componentize(
     features: &[String],
     all_features: bool,
     js: &str,
+    js_base_directory: Option<impl AsRef<Path>>,
     add_to_linker: Option<&dyn Fn(&mut Linker<Ctx>) -> anyhow::Result<()>>,
 ) -> anyhow::Result<Vec<u8>> {
     let mut resolve = Resolve {
@@ -170,6 +171,9 @@ pub async fn componentize(
     let stderr = MemoryOutputPipe::new(10000);
 
     let mut wasi = WasiCtxBuilder::new();
+    if let Some(dir) = js_base_directory {
+        wasi.preopened_dir(dir, "/", DirPerms::all(), FilePerms::all())?;
+    }
     let wasi = wasi
         .stdin(MemoryInputPipe::new(Bytes::new()))
         .stdout(stdout.clone())
