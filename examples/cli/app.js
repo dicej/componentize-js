@@ -7,16 +7,11 @@ export const wasiCliRun030Rc20260106 = {
         // `console.log`, so we must use the raw WASI bindings directly, which
         // is... verbose.
         
-        let [tx, rx] = witWorld.u8Stream()
-        let write = stdout.writeViaStream(rx)
+        const stream = witWorld.u8Stream()
+        using tx = stream[0], rx = stream[1]
+        const write = stdout.writeViaStream(rx)
         await tx.writeAll(new TextEncoder().encode("Hello, world!"))
-        
-        // Once the SpiderMonkey dep of the `mozjs` dep of `componentize-js` has
-        // been updated to support explicit resource management, we'll be able
-        // to use `using` declarations to dispose of streams.  For now, we must
-        // do it manually:
-        tx[_componentizeJsSymbolDispose]()
-        
+        tx[Symbol.dispose]()
         await write
     }
 }

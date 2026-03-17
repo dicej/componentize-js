@@ -21,7 +21,7 @@ use {
             Heap, JS_CallArgsFromVp, JS_GetFunctionObject, JS_HoldPrincipals, JSAutoRealm,
             JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSContext as RawJSContext, JSObject,
             JSTracer, ModuleErrorBehaviour, OnNewGlobalHookOption, PromiseState, PropertyKey,
-            SetModuleResolveHook, TraceKind, Value,
+            SetModuleResolveHook, SymbolCode, TraceKind, Value,
         },
         jsval::{
             BigIntValue, BooleanValue, DoubleValue, Int32Value, ObjectValue, StringValue,
@@ -33,14 +33,15 @@ use {
             wrappers2::{
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
                 CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
-                InitRealmStandardClasses, IsPromiseObject, JS_AddExtraGCRootsTracer,
-                JS_CallFunctionValue, JS_ClearPendingException, JS_DeleteProperty1, JS_GetElement,
-                JS_GetPendingException, JS_GetProperty, JS_InitDestroyPrincipalsCallback,
-                JS_IsExceptionPending, JS_NewBigInt64Array, JS_NewBigUint64Array, JS_NewFunction,
-                JS_NewGlobalObject, JS_NewObject, JS_NewObjectWithGivenProto,
-                JS_NewStringCopyUTF8N, JS_SetElement, JS_SetPendingException, JS_SetProperty,
-                JS_SetPropertyById, ModuleEvaluate, ModuleLink, NewArrayObject, NewArrayObject1,
-                NewPromiseObject, ResolvePromise, RunJobs, ThrowOnModuleEvaluationFailure,
+                GetWellKnownSymbol, InitRealmStandardClasses, IsPromiseObject,
+                JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_ClearPendingException,
+                JS_DeleteProperty1, JS_GetElement, JS_GetPendingException, JS_GetProperty,
+                JS_InitDestroyPrincipalsCallback, JS_IsExceptionPending, JS_NewBigInt64Array,
+                JS_NewBigUint64Array, JS_NewFunction, JS_NewGlobalObject, JS_NewObject,
+                JS_NewObjectWithGivenProto, JS_NewStringCopyUTF8N, JS_SetElement,
+                JS_SetPendingException, JS_SetProperty, JS_SetPropertyById, ModuleEvaluate,
+                ModuleLink, NewArrayObject, NewArrayObject1, NewPromiseObject, ResolvePromise,
+                RunJobs, ThrowOnModuleEvaluationFailure,
             },
         },
         typedarray::{
@@ -452,30 +453,18 @@ fn set(
     }
 }
 
-// TODO: As of this writing, `mozjs::jsapi::SymbolCode` does not include a
-// `dispose` variant.  Once we upgrade to a version that does, we can remove
-// this, stop using `JS_GetProperty` to get the symbol, and use
-// `GetWellKnownSymbol` instead.
-enum SymbolCode {
-    Dispose,
-}
-
 fn set_with_symbol(
     cx: &mut JSContext,
     object: Handle<'_, *mut JSObject>,
     code: SymbolCode,
     value: Handle<'_, Value>,
 ) {
-    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-    let name = match code {
-        SymbolCode::Dispose => c"_componentizeJsSymbolDispose",
-    };
-    rooted!(&in(cx) let symbol = get(cx, global_object.handle(), name).to_symbol());
+    rooted!(&in(cx) let symbol = unsafe { GetWellKnownSymbol(cx, code) });
     rooted!(&in(cx) let mut key = PropertyKey::default());
     unsafe { RUST_SYMBOL_TO_JSID(symbol.get(), key.handle_mut().into()) }
     if !unsafe { JS_SetPropertyById(cx, object, key.handle(), value) } {
         unsafe { PrintAndClearException(cx.raw_cx()) }
-        panic!("JS_SetPropertyById failed for `{}`", name.to_str().unwrap())
+        panic!("JS_SetPropertyById failed")
     }
 }
 
@@ -1309,7 +1298,7 @@ unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, tx.handle(), c"write", func.handle());
 
     rooted!(&in(cx) let mut func = wrap(cx, stream_drop_writable));
-    set_with_symbol(cx, tx.handle(), SymbolCode::Dispose, func.handle());
+    set_with_symbol(cx, tx.handle(), SymbolCode::dispose, func.handle());
 
     rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
     rooted!(&in(cx) let write_all = get(cx, global_object.handle(), c"_componentizeJsWriteAll"));
@@ -1326,7 +1315,7 @@ unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, rx.handle(), c"read", func.handle());
 
     rooted!(&in(cx) let mut func = wrap(cx, stream_drop_readable));
-    set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
+    set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
 
     rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
     args.rval().set(ObjectValue(unsafe {
@@ -1565,7 +1554,7 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, tx.handle(), c"write", func.handle());
 
     rooted!(&in(cx) let mut func = wrap(cx, future_drop_writable));
-    set_with_symbol(cx, tx.handle(), SymbolCode::Dispose, func.handle());
+    set_with_symbol(cx, tx.handle(), SymbolCode::dispose, func.handle());
 
     rooted!(&in(cx) let rx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
     set(cx, rx.handle(), TYPE_FIELD_NAME, unsafe {
@@ -1578,7 +1567,7 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, rx.handle(), c"read", func.handle());
 
     rooted!(&in(cx) let mut func = wrap(cx, future_drop_readable));
-    set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
+    set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
 
     rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
     args.rval().set(ObjectValue(unsafe {
@@ -2833,7 +2822,7 @@ impl Call for MyCall<'_> {
         set(cx, rx.handle(), c"read", func.handle());
 
         rooted!(&in(cx) let mut func = wrap(cx, future_drop_readable));
-        set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
+        set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
 
         self.push(ObjectValue(rx.get()))
     }
@@ -2847,7 +2836,7 @@ impl Call for MyCall<'_> {
         set(cx, rx.handle(), c"read", func.handle());
 
         rooted!(&in(cx) let mut func = wrap(cx, stream_drop_readable));
-        set_with_symbol(cx, rx.handle(), SymbolCode::Dispose, func.handle());
+        set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
 
         self.push(ObjectValue(rx.get()))
     }

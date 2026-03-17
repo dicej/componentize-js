@@ -4,33 +4,20 @@ import * as simpleAsyncImportAndExport from "componentize-js:tests/simple-async-
 import * as hostThingInterface from "componentize-js:tests/host-thing-interface"
 import * as witWorld from "wit-world"
 
-// TODO: As of this writing, the version of SpiderMonkey `mozjs` uses (140.x) is
-// just barely too old to support explicit resource mangement (e.g. `using`
-// declarations and `Symbol.dispose`).  Once we've upgraded, we should update
-// the following code to use them instead of calling
-// `_componentizeJsSymbolDispose` functions directly.
-
-async function pipeBytes(rx, tx) {
+async function pipeBytes(rxParam, txParam) {
+    using rx = rxParam, tx = txParam
     while (!(rx.writerDropped || tx.readerDropped)) {
         await tx.writeAll(await rx.read(1024))
     }
-
-    tx[_componentizeJsSymbolDispose]()
-    rx[_componentizeJsSymbolDispose]()
 }
 
-async function pipeStrings(rx, tx) {
-    // TODO: The version of SpiderMonkey we're using doesn't appear to support
-    // the `using` syntax, otherwise we would use it here.
+async function pipeStrings(rxParam, txParam) {
+    using rx = rxParam, tx = txParam
     await tx.write(await rx.read())
-
-    tx[_componentizeJsSymbolDispose]()
-    rx[_componentizeJsSymbolDispose]()
 }
 
-async function pipeThings(rx, tx, class_) {
-    // TODO: The version of SpiderMonkey we're using doesn't appear to support
-    // the `using` syntax, otherwise we would use it here.
+async function pipeThings(rxParam, txParam, class_) {
+    using rx = rxParam, tx = txParam
 
     // Read the things one at a time, forcing the host to re-take ownership of
     // any unwritten items between writes.
@@ -63,12 +50,11 @@ async function pipeThings(rx, tx, class_) {
     // Write the things all at once.  The host will read them only one at a time,
     // forcing us to re-take ownership of any unwritten items between writes.
     await tx.writeAll(things)
-
-    tx[_componentizeJsSymbolDispose]()
-    rx[_componentizeJsSymbolDispose]()
 }
 
-async function writeThing(thing, tx1, tx2) {
+async function writeThing(thingParam, tx1Param, tx2Param) {
+    using thing = thingParam, tx1 = tx1Param, tx2 = tx2Param
+
     // TODO: The version of SpiderMonkey we're using doesn't appear to support
     // the `using` syntax, otherwise we would use it here.
 
@@ -83,10 +69,6 @@ async function writeThing(thing, tx1, tx2) {
     if (!wrote) {
         throw Error()
     }
-
-    thing[_componentizeJsSymbolDispose]()
-    tx1[_componentizeJsSymbolDispose]()
-    tx2[_componentizeJsSymbolDispose]()
 }
 
 export const componentizeJsTestsSimpleExport = {
@@ -257,7 +239,7 @@ class Thing {
         }
         return v.value
     }
-    [_componentizeJsSymbolDispose]() {}
+    [Symbol.dispose]() {}
 }
 
 export const componentizeJsTestsStreamsAndFutures = {

@@ -127,7 +127,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                         format!("static {name}{code}\n")
                     }))
                     .chain(Some(
-                        "[_componentizeJsSymbolDispose](){{_componentizeJsDropResource.call(this)}}".to_string(),
+                        "[Symbol.dispose](){{_componentizeJsDropResource.call(this)}}".to_string(),
                     ))
                     .collect::<Vec<_>>()
                     .concat();
@@ -294,9 +294,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
     //
     // `_componentizeJsWriteAll` is a utility function for use with streams that
     // happens to be easier to write in JS than in Rust.
-    let globals = "var _componentizeJsSymbolDispose = Symbol.dispose || Symbol.for('dispose')
-
-var ComponentError = class extends Error {
+    let globals = "var ComponentError = class extends Error {
   constructor(value) {
     const enumerable = typeof value !== 'string';
     super(enumerable ? `${String(value)} (see error.payload)` : value);

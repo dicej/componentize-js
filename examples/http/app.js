@@ -1,5 +1,6 @@
 import { Request, Response, Fields } from "wasi:http/types@0.3.0-rc-2026-01-06"
 import * as client from "wasi:http/client@0.3.0-rc-2026-01-06"
+import * as stderr from "wasi:cli/stderr@0.3.0-rc-2026-01-06"
 import * as witWorld from "wit-world"
 import { IncrementalSHA256 as Sha256 } from "./sha256.js"
 
@@ -18,7 +19,7 @@ export const wasiHttpHandler030Rc20260106 = {
                   .map(([_, v]) => decoder.decode(v))
 
             const [tx, rx] = witWorld.u8Stream()
-            hashAll(urls, tx).catch((error) => _componentizeJsLog(error.toString()))
+            hashAll(urls, tx).catch((error) => log(error.toString()))
 
             return Response.new(
                 Fields.fromList([["content-type", encoder.encode("text/plain")]]),
@@ -41,14 +42,14 @@ export const wasiHttpHandler030Rc20260106 = {
     }
 }
 
-async function hashAll(urls, tx) {
+async function hashAll(urls, txParam) {
+    using tx = txParam
     let promises = urls.map((url) => [url, sha256(url)])
     while (promises.length > 0) {
         const [url, hash] = await Promise.race(promises.map(([_, v]) => v))
         promises = promises.filter(([k, _]) => k !== url)
         await tx.writeAll(encoder.encode(`${url}: ${hash}\n`))
     }
-    tx[_componentizeJsSymbolDispose]()
 }
 
 async function sha256(url) {
@@ -76,7 +77,7 @@ async function sha256(url) {
         break
     }
 
-    const request = Request.new(new Fields(), undefined, trailersFuture(), undefined)[0]
+    using request = Request.new(new Fields(), undefined, trailersFuture(), undefined)[0]
     request.setScheme(scheme)
     request.setAuthority(authority)
     request.setPathWithQuery(path)
@@ -87,14 +88,22 @@ async function sha256(url) {
         return [url, `unexpected status: ${status}`]
     }
 
-    const rx = Response.consumeBody(response, unitFuture())[0]
-
+    using rx = Response.consumeBody(response, unitFuture())[0]
     const hasher = new Sha256()
     while (!rx.writerDropped) {
         const chunk = await rx.read(16 * 1024)
         hasher.update(chunk)
     }
     return [url, hasher.digest()]
+}
+
+async function log(message) {
+    const stream = witWorld.u8Stream()
+    using tx = stream[0], rx = stream[1]
+    const write = stderr.writeViaStream(rx)
+    await tx.writeAll(encoder.encode(message))
+    tx[Symbol.dispose]()
+    await write
 }
 
 function trailersFuture() {
