@@ -42,8 +42,8 @@ export const wasiHttpHandler030Rc20260106 = {
     }
 }
 
-async function hashAll(urls, txParam) {
-    using tx = txParam
+async function hashAll(urls, tx) {
+    using _tx = tx
     let promises = urls.map((url) => [url, sha256(url)])
     while (promises.length > 0) {
         const [url, hash] = await Promise.race(promises.map(([_, v]) => v))
@@ -98,8 +98,8 @@ async function sha256(url) {
 }
 
 async function log(message) {
-    const stream = witWorld.u8Stream()
-    using tx = stream[0], rx = stream[1]
+    const [tx, rx] = witWorld.u8Stream()
+    using _tx = tx, _rx = rx
     const write = stderr.writeViaStream(rx)
     await tx.writeAll(encoder.encode(message))
     tx[Symbol.dispose]()

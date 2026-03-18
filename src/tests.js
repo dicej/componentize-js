@@ -4,20 +4,20 @@ import * as simpleAsyncImportAndExport from "componentize-js:tests/simple-async-
 import * as hostThingInterface from "componentize-js:tests/host-thing-interface"
 import * as witWorld from "wit-world"
 
-async function pipeBytes(rxParam, txParam) {
-    using rx = rxParam, tx = txParam
+async function pipeBytes(rx, tx) {
+    using _rx = rx, _tx = tx
     while (!(rx.writerDropped || tx.readerDropped)) {
         await tx.writeAll(await rx.read(1024))
     }
 }
 
-async function pipeStrings(rxParam, txParam) {
-    using rx = rxParam, tx = txParam
+async function pipeStrings(rx, tx) {
+    using _rx = rx, _tx = tx
     await tx.write(await rx.read())
 }
 
-async function pipeThings(rxParam, txParam, class_) {
-    using rx = rxParam, tx = txParam
+async function pipeThings(rx, tx, class_) {
+    using _rx = rx, _tx = tx
 
     // Read the things one at a time, forcing the host to re-take ownership of
     // any unwritten items between writes.
@@ -52,8 +52,8 @@ async function pipeThings(rxParam, txParam, class_) {
     await tx.writeAll(things)
 }
 
-async function writeThing(thingParam, tx1Param, tx2Param) {
-    using thing = thingParam, tx1 = tx1Param, tx2 = tx2Param
+async function writeThing(thing, tx1, tx2) {
+    using _thing = thing, _tx1 = tx1, _tx2 = tx2
 
     // The host will drop the first reader without reading, which should give us
     // back ownership of `thing`.

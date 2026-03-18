@@ -7,8 +7,8 @@ export const wasiCliRun030Rc20260106 = {
         // `console.log`, so we must use the raw WASI bindings directly, which
         // is... verbose.
         
-        const stream = witWorld.u8Stream()
-        using tx = stream[0], rx = stream[1]
+        const [tx, rx] = witWorld.u8Stream()
+        using _tx = tx, _rx = rx
         const write = stdout.writeViaStream(rx)
         await tx.writeAll(new TextEncoder().encode("Hello, world!"))
         tx[Symbol.dispose]()
