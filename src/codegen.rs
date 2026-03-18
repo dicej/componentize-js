@@ -276,7 +276,7 @@ pub fn generate(metadata: &Metadata) -> GeneratedCode {
                     "unitFuture".into()
                 };
                 let code = format!(
-                    "export function {name}(){{return _componentizeJsMakeFuture({index})}}\n"
+                    "export function {name}(f){{return _componentizeJsMakeFuture({index}, f)}}\n"
                 );
                 (name, code)
             }))
@@ -320,7 +320,14 @@ var _componentizeJsWriteAll = async function(buffer) {
     total += count
   }
   return total
-}"
+}
+
+var _componentizeJsMaybeWriteDefault = function() {
+  if (this._componentizeJsHandle) {
+    this.write(this.default())
+  }
+}
+"
     .to_string();
 
     modules.push(("wit-world".to_string(), world_module));

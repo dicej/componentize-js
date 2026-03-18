@@ -1406,35 +1406,6 @@ unsafe extern "C" fn future_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     true
 }
 
-unsafe extern "C" fn future_drop_writable(
-    cx: *mut RawJSContext,
-    argc: u32,
-    vp: *mut Value,
-) -> bool {
-    assert_eq!(argc, 0);
-
-    let args = unsafe { JS_CallArgsFromVp(argc, vp) };
-    let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
-    rooted!(&in(cx) let this = args.thisv().to_object());
-    let index = get(cx, this.handle(), TYPE_FIELD_NAME);
-    let handle = get(cx, this.handle(), HANDLE_FIELD_NAME);
-
-    if index.is_int32() && handle.is_int32() {
-        let index = index.to_int32() as u32;
-        let handle = handle.to_int32() as u32;
-        let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
-
-        unsafe { ty.drop_writable()(handle) };
-
-        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-            delete(cx, this.handle(), name);
-        }
-    }
-
-    args.rval().set(UndefinedValue());
-    true
-}
-
 unsafe extern "C" fn future_read(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert_eq!(argc, 0);
 
@@ -1530,11 +1501,12 @@ unsafe extern "C" fn future_drop_readable(
 }
 
 unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
-    assert_eq!(argc, 1);
+    assert_eq!(argc, 2);
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
     let index = args.index(0);
+    let default = args.index(1);
     let ty = WIT
         .get()
         .unwrap()
@@ -1552,8 +1524,12 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
 
     rooted!(&in(cx) let mut func = wrap(cx, future_write));
     set(cx, tx.handle(), c"write", func.handle());
+    set(cx, tx.handle(), c"default", unsafe {
+        Handle::from_raw(default)
+    });
 
-    rooted!(&in(cx) let mut func = wrap(cx, future_drop_writable));
+    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+    rooted!(&in(cx) let func = get(cx, global_object.handle(), c"_componentizeJsMaybeWriteDefault"));
     set_with_symbol(cx, tx.handle(), SymbolCode::dispose, func.handle());
 
     rooted!(&in(cx) let rx = unsafe { JS_NewObject(cx, ptr::null_mut()) });

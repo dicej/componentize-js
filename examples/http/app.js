@@ -107,13 +107,11 @@ async function log(message) {
 }
 
 function trailersFuture() {
-    const [tx, rx] = witWorld.resultOptionWasiHttpTypes030Rc20260106FieldsWasiHttpTypes030Rc20260106ErrorCodeFuture()
-    tx.write({ tag: 'ok' })
-    return rx
+    return witWorld.resultOptionWasiHttpTypes030Rc20260106FieldsWasiHttpTypes030Rc20260106ErrorCodeFuture(
+        () => { tag: 'ok' }
+    )[1]
 }
 
 function unitFuture() {
-    const [tx, rx] = witWorld.resultUnitWasiHttpTypes030Rc20260106ErrorCodeFuture()
-    tx.write({ tag: 'ok' })
-    return rx
+    return witWorld.resultUnitWasiHttpTypes030Rc20260106ErrorCodeFuture(() => { tag: 'ok' })[1]
 }

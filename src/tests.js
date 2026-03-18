@@ -239,6 +239,10 @@ class Thing {
     [Symbol.dispose]() {}
 }
 
+function unreachable() {
+    throw new Error()
+}
+
 export const componentizeJsTestsStreamsAndFutures = {
     echoStreamU8: function(stream) {
         let [tx, rx] = witWorld.u8Stream()
@@ -265,14 +269,14 @@ export const componentizeJsTestsStreamsAndFutures = {
         return Promise.resolve(rx)            
     },
     droppedFutureReader: function(value) {
-        let [tx1, rx1] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
-        let [tx2, rx2] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture()
+        let [tx1, rx1] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture(unreachable)
+        let [tx2, rx2] = witWorld.componentizeJsTestsStreamsAndFuturesThingFuture(unreachable)
         writeThing(new Thing(value), tx1, tx2).catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve([rx1, rx2])
     },
     droppedFutureReaderHost: function(value) {
-        let [tx1, rx1] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
-        let [tx2, rx2] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture()
+        let [tx1, rx1] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture(unreachable)
+        let [tx2, rx2] = witWorld.componentizeJsTestsHostThingInterfaceHostThingFuture(unreachable)
         writeThing(new hostThingInterface.HostThing(value), tx1, tx2)
             .catch((error) => _componentizeJsLog(error.toString()))
         return Promise.resolve([rx1, rx2])
