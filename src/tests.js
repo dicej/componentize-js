@@ -28,22 +28,22 @@ async function pipeThings(rxParam, txParam, class_) {
 
     let strings = ["a", "b", "c", "d", "e"];
     if (things.length !== strings.length) {
-        throw `expected ${strings.length} things; got ${things.length}`
+        throw new Error(`expected ${strings.length} things; got ${things.length}`)
     }
     
     for (let i = 0; i < things.length; ++i) {
         if (!(things[i] instanceof class_)) {
-            throw `expected ${class_.name}; got ${things[i].constructor.name}`
+            throw new Error(`expected ${class_.name}; got ${things[i].constructor.name}`)
         }
         
-        let s = await things[i].get()
-        if (s !== strings[i]) {
-            throw `expected ${strings[i]}; got ${s}`
+        let string = await things[i].get()
+        if (string !== strings[i]) {
+            throw new Error(`expected ${strings[i]}; got ${string}`)
         }
 
-        s = await class_.getStatic(things[i])
-        if (s !== strings[i]) {
-            throw `expected ${strings[i]}; got ${s}`
+        string = await class_.getStatic(things[i])
+        if (string !== strings[i]) {
+            throw new Error(`expected ${strings[i]}; got ${string}`)
         }
     }
 
@@ -55,19 +55,16 @@ async function pipeThings(rxParam, txParam, class_) {
 async function writeThing(thingParam, tx1Param, tx2Param) {
     using thing = thingParam, tx1 = tx1Param, tx2 = tx2Param
 
-    // TODO: The version of SpiderMonkey we're using doesn't appear to support
-    // the `using` syntax, otherwise we would use it here.
-
     // The host will drop the first reader without reading, which should give us
     // back ownership of `thing`.
     let wrote = await tx1.write(thing)
     if (wrote) {
-        throw Error()
+        throw new Error()
     }
     // The host will read from the second reader, though.
     wrote = await tx2.write(thing)
     if (!wrote) {
-        throw Error()
+        throw new Error()
     }
 }
 
