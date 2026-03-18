@@ -530,6 +530,35 @@ fn resolve(cx: &mut JSContext, promise: Handle<'_, *mut JSObject>, value: Handle
     }
 }
 
+fn register_resource(cx: &mut JSContext, value: Handle<'_, *mut JSObject>, handle: u32) {
+    rooted!(&in(cx) let handle = UInt32Value(handle));
+    set(cx, value, HANDLE_FIELD_NAME, handle.handle());
+
+    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+    rooted!(&in(cx) let register = get(cx, global_object.handle(), c"_componentizeJsRegisterFinalizer"));
+    rooted!(&in(cx) let params = vec![ObjectValue(value.get())]);
+    call(
+        cx,
+        global_object.handle(),
+        register.handle(),
+        &HandleValueArray::from(&params),
+    );
+}
+
+fn unregister_resource(cx: &mut JSContext, value: Handle<'_, *mut JSObject>) {
+    rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
+    rooted!(&in(cx) let unregister = get(cx, global_object.handle(), c"_componentizeJsUnregisterFinalizer"));
+    rooted!(&in(cx) let params = vec![ObjectValue(value.get())]);
+    call(
+        cx,
+        global_object.handle(),
+        unregister.handle(),
+        &HandleValueArray::from(&params),
+    );
+
+    delete(cx, value, HANDLE_FIELD_NAME);
+}
+
 fn release_borrows(cx: &mut JSContext, traced: &Mutex<MyCallTraced>) {
     // Note that we're careful here to leave all but the current borrow in
     // `traced` (and immediately root the `Borrow::value` before doing anything
@@ -543,9 +572,7 @@ fn release_borrows(cx: &mut JSContext, traced: &Mutex<MyCallTraced>) {
     }) = traced.try_lock().unwrap().borrows.pop()
     {
         rooted!(&in(cx) let value = value.get());
-        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-            delete(cx, value.handle(), name);
-        }
+        unregister_resource(cx, value.handle());
 
         unsafe {
             drop(handle);
@@ -577,8 +604,7 @@ fn restore_resources(cx: &mut JSContext, traced: &Mutex<TransmitTraced>, count: 
 
     while let Some(resource) = pop_resource() {
         rooted!(&in(cx) let wrapper = resource.value.get());
-        rooted!(&in(cx) let handle = UInt32Value(resource.handle));
-        set(cx, wrapper.handle(), HANDLE_FIELD_NAME, handle.handle());
+        register_resource(cx, wrapper.handle(), resource.handle);
     }
 }
 
@@ -1015,11 +1041,9 @@ unsafe extern "C" fn drop_resource(cx: *mut RawJSContext, argc: u32, vp: *mut Va
         let handle = handle.to_int32() as u32;
         let ty = WIT.get().unwrap().resource(usize::try_from(index).unwrap());
 
-        unsafe { ty.drop()(handle) };
+        unregister_resource(cx, this.handle());
 
-        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-            delete(cx, this.handle(), name);
-        }
+        unsafe { ty.drop()(handle) };
     }
 
     args.rval().set(UndefinedValue());
@@ -1045,6 +1069,9 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
     rooted!(&in(cx) let values = args.index(0).to_object());
     let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
+
+    // TODO: unregister resource and then reregister upon (possibly async)
+    // completion to prevent concurrent reads.
 
     let write_count = if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
         unsafe { typed_array_data(ty, args.index(0).to_object()) }.1
@@ -1159,11 +1186,9 @@ unsafe extern "C" fn stream_drop_writable(
         let handle = handle.to_int32() as u32;
         let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
 
-        unsafe { ty.drop_writable()(handle) };
+        unregister_resource(cx, this.handle());
 
-        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-            delete(cx, this.handle(), name);
-        }
+        unsafe { ty.drop_writable()(handle) };
     }
 
     args.rval().set(UndefinedValue());
@@ -1179,6 +1204,9 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let index = usize::try_from(get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32).unwrap();
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
     let ty = WIT.get().unwrap().stream(index);
+
+    // TODO: unregister resource and then reregister upon (possibly async)
+    // completion to prevent concurrent reads.
 
     let max_count = usize::try_from(args.index(0).to_int32() as u32).unwrap();
     let layout =
@@ -1262,11 +1290,9 @@ unsafe extern "C" fn stream_drop_readable(
         let handle = handle.to_int32() as u32;
         let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
 
-        unsafe { ty.drop_readable()(handle) };
+        unregister_resource(cx, this.handle());
 
-        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-            delete(cx, this.handle(), name);
-        }
+        unsafe { ty.drop_readable()(handle) };
     }
 
     args.rval().set(UndefinedValue());
@@ -1291,14 +1317,14 @@ unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, tx.handle(), TYPE_FIELD_NAME, unsafe {
         Handle::from_raw(index)
     });
-    rooted!(&in(cx) let tx_handle = UInt32Value(tx_handle));
-    set(cx, tx.handle(), HANDLE_FIELD_NAME, tx_handle.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, stream_write));
-    set(cx, tx.handle(), c"write", func.handle());
+    rooted!(&in(cx) let mut write = wrap(cx, stream_write));
+    set(cx, tx.handle(), c"write", write.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, stream_drop_writable));
-    set_with_symbol(cx, tx.handle(), SymbolCode::dispose, func.handle());
+    rooted!(&in(cx) let mut dispose = wrap(cx, stream_drop_writable));
+    set_with_symbol(cx, tx.handle(), SymbolCode::dispose, dispose.handle());
+
+    register_resource(cx, tx.handle(), tx_handle);
 
     rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
     rooted!(&in(cx) let write_all = get(cx, global_object.handle(), c"_componentizeJsWriteAll"));
@@ -1308,14 +1334,14 @@ unsafe extern "C" fn make_stream(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, rx.handle(), TYPE_FIELD_NAME, unsafe {
         Handle::from_raw(index)
     });
-    rooted!(&in(cx) let rx_handle = UInt32Value(rx_handle));
-    set(cx, rx.handle(), HANDLE_FIELD_NAME, rx_handle.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, stream_read));
-    set(cx, rx.handle(), c"read", func.handle());
+    rooted!(&in(cx) let mut read = wrap(cx, stream_read));
+    set(cx, rx.handle(), c"read", read.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, stream_drop_readable));
-    set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
+    rooted!(&in(cx) let mut dispose = wrap(cx, stream_drop_readable));
+    set_with_symbol(cx, rx.handle(), SymbolCode::dispose, dispose.handle());
+
+    register_resource(cx, rx.handle(), rx_handle);
 
     rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
     args.rval().set(ObjectValue(unsafe {
@@ -1336,10 +1362,8 @@ unsafe extern "C" fn future_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     let index = get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32;
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
 
-    // TODO: will need to restore these on cancellation once that's supported:
-    for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-        delete(cx, this.handle(), name);
-    }
+    // TODO: will need to re-register on cancellation once that's supported:
+    unregister_resource(cx, this.handle());
 
     let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
 
@@ -1418,10 +1442,8 @@ unsafe extern "C" fn future_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let index = usize::try_from(get(cx, this.handle(), TYPE_FIELD_NAME).to_int32() as u32).unwrap();
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
 
-    // TODO: will need to restore these on cancellation once that's supported:
-    for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-        delete(cx, this.handle(), name);
-    }
+    // TODO: will need to re-register on cancellation once that's supported:
+    unregister_resource(cx, this.handle());
 
     let ty = WIT.get().unwrap().future(index);
 
@@ -1489,11 +1511,9 @@ unsafe extern "C" fn future_drop_readable(
         let handle = handle.to_int32() as u32;
         let ty = WIT.get().unwrap().future(usize::try_from(index).unwrap());
 
-        unsafe { ty.drop_readable()(handle) };
+        unregister_resource(cx, this.handle());
 
-        for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-            delete(cx, this.handle(), name);
-        }
+        unsafe { ty.drop_readable()(handle) };
     }
 
     args.rval().set(UndefinedValue());
@@ -1519,31 +1539,31 @@ unsafe extern "C" fn make_future(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     set(cx, tx.handle(), TYPE_FIELD_NAME, unsafe {
         Handle::from_raw(index)
     });
-    rooted!(&in(cx) let tx_handle = UInt32Value(tx_handle));
-    set(cx, tx.handle(), HANDLE_FIELD_NAME, tx_handle.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, future_write));
-    set(cx, tx.handle(), c"write", func.handle());
+    rooted!(&in(cx) let mut write = wrap(cx, future_write));
+    set(cx, tx.handle(), c"write", write.handle());
     set(cx, tx.handle(), c"default", unsafe {
         Handle::from_raw(default)
     });
 
     rooted!(&in(cx) let global_object = unsafe { CurrentGlobalOrNull(cx) });
-    rooted!(&in(cx) let func = get(cx, global_object.handle(), c"_componentizeJsMaybeWriteDefault"));
-    set_with_symbol(cx, tx.handle(), SymbolCode::dispose, func.handle());
+    rooted!(&in(cx) let dispose = get(cx, global_object.handle(), c"_componentizeJsMaybeWriteDefault"));
+    set_with_symbol(cx, tx.handle(), SymbolCode::dispose, dispose.handle());
+
+    register_resource(cx, tx.handle(), tx_handle);
 
     rooted!(&in(cx) let rx = unsafe { JS_NewObject(cx, ptr::null_mut()) });
     set(cx, rx.handle(), TYPE_FIELD_NAME, unsafe {
         Handle::from_raw(index)
     });
-    rooted!(&in(cx) let rx_handle = UInt32Value(rx_handle));
-    set(cx, rx.handle(), HANDLE_FIELD_NAME, rx_handle.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, future_read));
-    set(cx, rx.handle(), c"read", func.handle());
+    rooted!(&in(cx) let mut read = wrap(cx, future_read));
+    set(cx, rx.handle(), c"read", read.handle());
 
-    rooted!(&in(cx) let mut func = wrap(cx, future_drop_readable));
-    set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
+    rooted!(&in(cx) let mut dispose = wrap(cx, future_drop_readable));
+    set_with_symbol(cx, rx.handle(), SymbolCode::dispose, dispose.handle());
+
+    register_resource(cx, rx.handle(), rx_handle);
 
     rooted!(&in(cx) let elements = vec![ObjectValue(tx.get()), ObjectValue(rx.get())]);
     args.rval().set(ObjectValue(unsafe {
@@ -2317,7 +2337,7 @@ impl MyCall<'_> {
         let handle = get(cx, value.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
 
         if owned {
-            delete(cx, value.handle(), HANDLE_FIELD_NAME);
+            unregister_resource(cx, value.handle());
 
             if let Some(resources) = &mut self.traced.try_lock().unwrap().resources.as_mut() {
                 resources.push(EmptyResource {
@@ -2759,7 +2779,8 @@ impl Call for MyCall<'_> {
                 .get()
         } else {
             // imported resource type
-            let value = imported_resource_from_canon(&mut context(), ty.index(), handle, Some(ty));
+            let value =
+                imported_resource_from_canon(&mut context(), ty.index(), handle, None, Some(ty));
 
             self.traced.try_lock().unwrap().borrows.push(Borrow {
                 value: Heap::boxed(value),
@@ -2778,41 +2799,35 @@ impl Call for MyCall<'_> {
             let rep = unsafe { rep(handle) };
             rooted!(&in(cx) let value = EXPORTED_RESOURCES.try_lock().unwrap().0.remove(rep).get());
 
-            for name in [HANDLE_FIELD_NAME, TYPE_FIELD_NAME] {
-                delete(cx, value.handle(), name);
-            }
+            unregister_resource(cx, value.handle());
 
             value.get()
         } else {
             // imported resource type
-            imported_resource_from_canon(cx, ty.index(), handle, Some(ty))
+            imported_resource_from_canon(cx, ty.index(), handle, None, Some(ty))
         }));
     }
 
     fn push_future(&mut self, ty: wit::Future, handle: u32) {
         let cx = &mut context();
-        let stream = imported_resource_from_canon(cx, ty.index(), handle, None);
+        let stream =
+            imported_resource_from_canon(cx, ty.index(), handle, Some(future_drop_readable), None);
         rooted!(&in(cx) let rx = stream);
 
         rooted!(&in(cx) let mut func = wrap(cx, future_read));
         set(cx, rx.handle(), c"read", func.handle());
-
-        rooted!(&in(cx) let mut func = wrap(cx, future_drop_readable));
-        set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
 
         self.push(ObjectValue(rx.get()))
     }
 
     fn push_stream(&mut self, ty: wit::Stream, handle: u32) {
         let cx = &mut context();
-        let stream = imported_resource_from_canon(cx, ty.index(), handle, None);
+        let stream =
+            imported_resource_from_canon(cx, ty.index(), handle, Some(stream_drop_readable), None);
         rooted!(&in(cx) let rx = stream);
 
         rooted!(&in(cx) let mut func = wrap(cx, stream_read));
         set(cx, rx.handle(), c"read", func.handle());
-
-        rooted!(&in(cx) let mut func = wrap(cx, stream_drop_readable));
-        set_with_symbol(cx, rx.handle(), SymbolCode::dispose, func.handle());
 
         self.push(ObjectValue(rx.get()))
     }
@@ -2911,6 +2926,7 @@ fn imported_resource_from_canon(
     cx: &mut JSContext,
     index: usize,
     handle: u32,
+    dispose: Option<JsFunction>,
     ty: Option<wit::Resource>,
 ) -> *mut JSObject {
     let wrapper = if let Some(ty) = ty {
@@ -2939,11 +2955,16 @@ fn imported_resource_from_canon(
         unsafe { JS_NewObject(cx, ptr::null_mut()) }
     };
     rooted!(&in(cx) let wrapper = wrapper);
-    rooted!(&in(cx) let handle = UInt32Value(handle));
-    set(cx, wrapper.handle(), HANDLE_FIELD_NAME, handle.handle());
 
     rooted!(&in(cx) let index = UInt32Value(index.try_into().unwrap()));
     set(cx, wrapper.handle(), TYPE_FIELD_NAME, index.handle());
+
+    if let Some(dispose) = dispose {
+        rooted!(&in(cx) let mut dispose = wrap(cx, dispose));
+        set_with_symbol(cx, wrapper.handle(), SymbolCode::dispose, dispose.handle());
+    }
+
+    register_resource(cx, wrapper.handle(), handle);
 
     wrapper.get()
 }
@@ -2968,13 +2989,10 @@ fn exported_resource_to_canon(
 
         let handle = unsafe { new(rep) };
 
-        {
-            rooted!(&in(cx) let handle = UInt32Value(handle));
-            set(cx, value.handle(), HANDLE_FIELD_NAME, handle.handle());
-        }
-
         rooted!(&in(cx) let index = UInt32Value(ty.index().try_into().unwrap()));
         set(cx, value.handle(), TYPE_FIELD_NAME, index.handle());
+
+        register_resource(cx, value.handle(), handle);
 
         handle
     }
