@@ -33,7 +33,7 @@ and possibly at a higher level of abstraction outside of this crate.
 - [x] resource/stream/future disposal using [`Symbol.dispose`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/dispose)
 - [x] add a CLI interface
 - [x] add example(s)
-- [ ] resource/stream/future finalization
+- [x] resource/stream/future finalization
 - [ ] integrate with StarlingMonkey for Web and Node API support
 - [ ] lint and run tests (including examples) in CI
 - [ ] generate (and validate in CI) TypeScript bindings (possibly reuse existing `ComponentizeJS` code)
