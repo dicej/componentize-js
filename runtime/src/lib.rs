@@ -21,7 +21,7 @@ use {
             Heap, JS_CallArgsFromVp, JS_GetFunctionObject, JS_HoldPrincipals, JSAutoRealm,
             JSCLASS_GLOBAL_FLAGS, JSClass, JSClassOps, JSContext as RawJSContext, JSObject,
             JSTracer, ModuleErrorBehaviour, OnNewGlobalHookOption, PromiseState, PropertyKey,
-            SetModuleResolveHook, SymbolCode, TraceKind, Value,
+            SetModuleResolveHook, SymbolCode, ToBigInt64, ToBigUint64, TraceKind, Value,
         },
         jsval::{
             BigIntValue, BooleanValue, DoubleValue, Int32Value, ObjectValue, StringValue,
@@ -31,9 +31,9 @@ use {
         rust::{
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime, ToString,
             wrappers2::{
-                BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
-                CurrentGlobalOrNull, Evaluate2, GetArrayLength, GetModuleRequestSpecifier,
-                GetPromiseState, GetWellKnownSymbol, InitRealmStandardClasses, IsPromiseObject,
+                BigIntFromInt64, BigIntFromUint64, CompileModule1, Construct1, CurrentGlobalOrNull,
+                Evaluate2, GetArrayLength, GetModuleRequestSpecifier, GetPromiseState,
+                GetWellKnownSymbol, InitRealmStandardClasses, IsPromiseObject,
                 JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_ClearPendingException,
                 JS_DeleteProperty1, JS_GetElement, JS_GetPendingException, JS_GetProperty,
                 JS_InitDestroyPrincipalsCallback, JS_IsExceptionPending, JS_NewBigInt64Array,
@@ -1069,6 +1069,9 @@ unsafe extern "C" fn log(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bo
 unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert_eq!(argc, 1);
 
+    // TODO: Detect and raise exception if stream already has a pending
+    // operation or has been dropped.
+
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
     rooted!(&in(cx) let this = args.thisv().to_object());
@@ -1204,6 +1207,9 @@ unsafe extern "C" fn stream_drop_writable(
 
 unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Value) -> bool {
     assert_eq!(argc, 1);
+
+    // TODO: Detect and raise exception if stream already has a pending
+    // operation or has been dropped.
 
     let args = unsafe { JS_CallArgsFromVp(argc, vp) };
     let cx = &mut unsafe { JSContext::from_ptr(NonNull::new(cx).unwrap()) };
@@ -2407,13 +2413,7 @@ impl Call for MyCall<'_> {
         if value.is_int32() {
             value.to_int32() as u64
         } else {
-            // TODO: is there a more efficient way to do this?
-            let cx = &mut context();
-            rooted!(&in(cx) let value = value.to_bigint());
-            rooted!(&in(cx) let value = unsafe { BigIntToString(cx, value.handle(), 10) });
-            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(value.get()).unwrap()) }
-                .parse()
-                .unwrap()
+            unsafe { ToBigUint64(value.to_bigint()) }
         }
     }
 
@@ -2434,13 +2434,7 @@ impl Call for MyCall<'_> {
         if value.is_int32() {
             value.to_int32() as i64
         } else {
-            // TODO: is there a more efficient way to do this?
-            let cx = &mut context();
-            rooted!(&in(cx) let value = value.to_bigint());
-            rooted!(&in(cx) let value = unsafe { BigIntToString(cx, value.handle(), 10) });
-            unsafe { jsstr_to_string(cx.raw_cx(), NonNull::new(value.get()).unwrap()) }
-                .parse()
-                .unwrap()
+            unsafe { ToBigInt64(value.to_bigint()) }
         }
     }
 
