@@ -32,8 +32,8 @@ use {
             self, CompileOptionsWrapper, JSEngine, RealmOptions, Runtime, ToString,
             wrappers2::{
                 BigIntFromInt64, BigIntFromUint64, BigIntToString, CompileModule1, Construct1,
-                CurrentGlobalOrNull, Evaluate2, GetModuleRequestSpecifier, GetPromiseState,
-                GetWellKnownSymbol, InitRealmStandardClasses, IsPromiseObject,
+                CurrentGlobalOrNull, Evaluate2, GetArrayLength, GetModuleRequestSpecifier,
+                GetPromiseState, GetWellKnownSymbol, InitRealmStandardClasses, IsPromiseObject,
                 JS_AddExtraGCRootsTracer, JS_CallFunctionValue, JS_ClearPendingException,
                 JS_DeleteProperty1, JS_GetElement, JS_GetPendingException, JS_GetProperty,
                 JS_InitDestroyPrincipalsCallback, JS_IsExceptionPending, JS_NewBigInt64Array,
@@ -425,8 +425,6 @@ fn context() -> JSContext {
 
 fn get(cx: &mut JSContext, object: Handle<'_, *mut JSObject>, name: &CStr) -> Value {
     rooted!(&in(cx) let mut value = UndefinedValue());
-    // TODO: Is there a quicker way to get the array length, e.g. using
-    // `JS_GetPropertyById`?
     if !unsafe {
         JS_GetProperty(
             cx,
@@ -466,6 +464,15 @@ fn set_with_symbol(
         unsafe { PrintAndClearException(cx.raw_cx()) }
         panic!("JS_SetPropertyById failed")
     }
+}
+
+fn get_length(cx: &mut JSContext, object: Handle<'_, *mut JSObject>) -> u32 {
+    let mut length = 0;
+    if !unsafe { GetArrayLength(cx, object, &mut length) } {
+        unsafe { PrintAndClearException(cx.raw_cx()) }
+        panic!("GetArrayLength failed")
+    }
+    length
 }
 
 fn get_element(cx: &mut JSContext, object: Handle<'_, *mut JSObject>, index: u32) -> Value {
@@ -861,9 +868,7 @@ unsafe extern "C" fn call_import(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let index = args.index(0);
     let params = args.index(1);
     rooted!(&in(cx) let params = params.to_object());
-    // TODO: Is there a quicker way to get the array length, e.g. using
-    // `JS_GetPropertyById`?
-    let length = u32::try_from(get(cx, params.handle(), c"length").to_int32()).unwrap();
+    let length = get_length(cx, params.handle());
     let func = WIT
         .get()
         .unwrap()
@@ -1071,14 +1076,12 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
 
     // TODO: unregister resource and then reregister upon (possibly async)
-    // completion to prevent concurrent reads.
+    // completion to prevent concurrent writes.
 
     let write_count = if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
         unsafe { typed_array_data(ty, args.index(0).to_object()) }.1
     } else {
-        // TODO: Is there a quicker way to get the array length, e.g. using
-        // `JS_GetPropertyById`?
-        usize::try_from(get(cx, values.handle(), c"length").to_int32()).unwrap()
+        usize::try_from(get_length(cx, values.handle())).unwrap()
     };
 
     let layout =
@@ -2617,12 +2620,7 @@ impl Call for MyCall<'_> {
         self.iter_stack.push(0);
         let cx = &mut context();
         rooted!(&in(cx) let list = self.last().to_object());
-        // TODO: Is there a quicker way to get the array length, e.g. using
-        // `JS_GetPropertyById`?
-        get(cx, list.handle(), c"length")
-            .to_int32()
-            .try_into()
-            .unwrap()
+        get_length(cx, list.handle()).try_into().unwrap()
     }
 
     fn pop_iter_next(&mut self, _ty: List) {
