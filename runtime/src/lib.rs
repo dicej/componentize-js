@@ -183,12 +183,14 @@ enum Pending {
     StreamWrite {
         _call: MyCall<'static>,
         traced: Arc<Mutex<TransmitTraced>>,
+        handle: u32,
     },
     StreamRead {
         call: MyCall<'static>,
         buffer: *mut u8,
         traced: Arc<Mutex<TransmitTraced>>,
         index: usize,
+        handle: u32,
     },
     FutureWrite {
         _call: MyCall<'static>,
@@ -1075,9 +1077,6 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     rooted!(&in(cx) let values = args.index(0).to_object());
     let ty = WIT.get().unwrap().stream(usize::try_from(index).unwrap());
 
-    // TODO: unregister resource and then reregister upon (possibly async)
-    // completion to prevent concurrent writes.
-
     let write_count = if let Some(ty) = ty.ty().filter(|&v| use_typed_array(v)) {
         unsafe { typed_array_data(ty, args.index(0).to_object()) }.1
     } else {
@@ -1139,6 +1138,10 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
     let code = unsafe { ty.write()(handle, buffer.cast(), write_count) };
 
     if code == RETURN_CODE_BLOCKED {
+        // Prevent this stream from being written to again (or given away, or
+        // dropped) until the write completes or is cancelled:
+        unregister_resource(cx, this.handle());
+
         let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
         let state = &mut state.as_mut().unwrap().0;
         if state.waitable_set.is_none() {
@@ -1151,6 +1154,7 @@ unsafe extern "C" fn stream_write(cx: *mut RawJSContext, argc: u32, vp: *mut Val
             Pending::StreamWrite {
                 _call: call,
                 traced,
+                handle,
             },
         );
     } else {
@@ -1208,9 +1212,6 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     let handle = get(cx, this.handle(), HANDLE_FIELD_NAME).to_int32() as u32;
     let ty = WIT.get().unwrap().stream(index);
 
-    // TODO: unregister resource and then reregister upon (possibly async)
-    // completion to prevent concurrent reads.
-
     let max_count = usize::try_from(args.index(0).to_int32() as u32).unwrap();
     let layout =
         Layout::from_size_align(ty.abi_payload_size() * max_count, ty.abi_payload_align()).unwrap();
@@ -1227,6 +1228,10 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
     rooted!(&in(cx) let promise = unsafe { NewPromiseObject(cx, Handle::<*mut JSObject>::null()) });
 
     if code == RETURN_CODE_BLOCKED {
+        // Prevent this stream from being written to again (or given away, or
+        // dropped) until the write completes or is cancelled:
+        unregister_resource(cx, this.handle());
+
         let mut state = CURRENT_TASK_STATE.try_lock().unwrap();
         let state = &mut state.as_mut().unwrap().0;
         if state.waitable_set.is_none() {
@@ -1241,6 +1246,7 @@ unsafe extern "C" fn stream_read(cx: *mut RawJSContext, argc: u32, vp: *mut Valu
                 buffer,
                 traced: TransmitTraced::new(this.get(), promise.get(), None),
                 index,
+                handle,
             },
         );
     } else {
@@ -2101,12 +2107,17 @@ impl Interpreter for MyInterpreter {
                     .remove(&event1)
                     .unwrap();
 
-                let Pending::StreamWrite { traced, .. } = pending else {
+                let &Pending::StreamWrite {
+                    ref traced, handle, ..
+                } = pending
+                else {
                     unreachable!()
                 };
 
                 rooted!(&in(cx) let stream = traced.try_lock().unwrap().wrapper.get());
                 rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
+
+                register_resource(cx, stream.handle(), handle);
 
                 let count = event2 >> 4;
                 let code = event2 & 0xF;
@@ -2139,7 +2150,7 @@ impl Interpreter for MyInterpreter {
                     buffer,
                     ref mut call,
                     index,
-                    ..
+                    handle,
                 } = pending
                 else {
                     unreachable!()
@@ -2147,6 +2158,8 @@ impl Interpreter for MyInterpreter {
 
                 rooted!(&in(cx) let stream = traced.try_lock().unwrap().wrapper.get());
                 rooted!(&in(cx) let promise = traced.try_lock().unwrap().promise.get());
+
+                register_resource(cx, stream.handle(), handle);
 
                 let ty = WIT.get().unwrap().stream(index);
 
