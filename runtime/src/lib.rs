@@ -2453,8 +2453,10 @@ impl Call for MyCall<'_> {
     }
 
     fn pop_f32(&mut self) -> f32 {
-        // TODO: Assert that the number fits into an f32 losslessly
-        self.pop().to_number() as f32
+        let number64 = self.pop().to_number();
+        let number32 = number64 as f32;
+        assert!((number64.is_nan() && number32.is_nan()) || number64 == number32 as f64);
+        number32
     }
 
     fn pop_f64(&mut self) -> f64 {
