@@ -5,7 +5,8 @@ use {
     std::{
         env,
         fs::{self, File},
-        io, iter, mem,
+        io::{self, Cursor},
+        iter, mem,
         path::{Path, PathBuf},
         process::Command,
     },
@@ -107,7 +108,11 @@ fn compress(
             File::create(dst_dir.join(format!("{name}.zst")))?,
             ZSTD_COMPRESSION_LEVEL,
         )?;
-        io::copy(&mut File::open(path)?, &mut encoder)?;
+        if STRIP_RUNTIME && name.ends_with(".so") {
+            io::copy(&mut Cursor::new(strip(&fs::read(path)?)?), &mut encoder)?;
+        } else {
+            io::copy(&mut File::open(path)?, &mut encoder)?;
+        }
         encoder.do_finish()?;
         Ok(())
     } else {
@@ -167,10 +172,6 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<(
                 .arg(&path)
                 .arg("-Wl,--no-whole-archive")
                 .arg("-lwasi-emulated-getpid"))?;
-
-            if STRIP_RUNTIME {
-                fs::write(out_dir.join(name), &strip(&fs::read(out_dir.join(name))?)?)?;
-            }
 
             compress(out_dir, name, out_dir, false)?;
         } else {
