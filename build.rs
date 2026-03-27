@@ -140,9 +140,12 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<(
         }
     }
 
-    cmd.env("RUSTFLAGS", "-C relocation-model=pic")
-        .env("CARGO_TARGET_DIR", out_dir)
-        .env("MOZJS_FROM_SOURCE", "1");
+    cmd.env(
+        "RUSTFLAGS",
+        "-C relocation-model=pic -Z default-visibility=hidden",
+    )
+    .env("CARGO_TARGET_DIR", out_dir)
+    .env("MOZJS_FROM_SOURCE", "1");
 
     let status = cmd.status()?;
     assert!(status.success());
