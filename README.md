@@ -14,10 +14,6 @@ making it easier to extend the runtime using Rust instead of C++.
 
 ## Status
 
-As of this writing, the binding generator generates ultra-minimal,
-not-very-idiomatic code which works but isn't very pretty.  We plan to improve
-that soon.
-
 Note that this project is ultimately intended to become an integral part of
 [StarlingMonkey](https://github.com/bytecodealliance/StarlingMonkey), and so
 some of the below to-do items may be addressed after that integration happens,
