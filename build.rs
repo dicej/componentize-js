@@ -1,12 +1,12 @@
 #![deny(warnings)]
 
 use {
-    anyhow::{Context as _, anyhow, bail},
+    anyhow::{anyhow, bail},
     std::{
         env,
         fs::{self, File},
         io::{self, Cursor},
-        iter, mem,
+        mem,
         path::{Path, PathBuf},
         process::Command,
     },
@@ -121,15 +121,10 @@ fn compress(
 }
 
 fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<()> {
-    let mut cmd = Command::new("rustup");
+    let mut cmd = Command::new("cargo");
     cmd.current_dir("runtime")
-        .arg("run")
-        .arg("nightly")
-        .arg("cargo")
         .arg("build")
-        .arg("-Z")
-        .arg("build-std=panic_abort,std")
-        .arg("--target=wasm32-wasip1");
+        .arg("--target=wasm32-wasip2");
 
     if !DEBUG_RUNTIME {
         cmd.arg("--release");
@@ -147,7 +142,15 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<(
 
     cmd.env(
         "RUSTFLAGS",
-        "-C relocation-model=pic -Z default-visibility=hidden",
+        "-C relocation-model=pic \
+         -Clink-args=-Wl,--skip-wit-component \
+         -Clink-args=-shared \
+         -Clink-args=-lwasi-emulated-getpid \
+         -Clink-self-contained=n",
+    )
+    .env(
+        "CARGO_TARGET_WASM32_WASIP2_LINKER",
+        wasi_sdk.join(format!("bin/{CLANG_EXECUTABLE}")),
     )
     .env("CARGO_TARGET_DIR", out_dir)
     .env("MOZJS_FROM_SOURCE", "1");
@@ -158,25 +161,12 @@ fn make_runtime(out_dir: &Path, wasi_sdk: &Path, name: &str) -> anyhow::Result<(
 
     let build = if DEBUG_RUNTIME { "debug" } else { "release" };
     let path = out_dir.join(format!(
-        "wasm32-wasip1/{build}/libcomponentize_js_runtime.a"
+        "wasm32-wasip2/{build}/componentize_js_runtime.wasm"
     ));
 
     if path.exists() {
-        let clang = wasi_sdk.join(format!("bin/{CLANG_EXECUTABLE}"));
-        if clang.exists() {
-            run(Command::new(clang)
-                .arg("-shared")
-                .arg("-o")
-                .arg(out_dir.join(name))
-                .arg("-Wl,--whole-archive")
-                .arg(&path)
-                .arg("-Wl,--no-whole-archive")
-                .arg("-lwasi-emulated-getpid"))?;
-
-            compress(out_dir, name, out_dir, false)?;
-        } else {
-            bail!("no such file: {}", clang.display())
-        }
+        fs::copy(&path, out_dir.join(name))?;
+        compress(out_dir, name, out_dir, false)?;
     } else {
         bail!("no such file: {}", path.display())
     }
@@ -242,26 +232,4 @@ fn strip(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     }
 
     Ok(output)
-}
-
-fn run(command: &mut Command) -> anyhow::Result<Vec<u8>> {
-    let command_string = iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|arg| arg.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let output = command.output().with_context({
-        let command_string = command_string.clone();
-        move || command_string
-    })?;
-
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        bail!(
-            "command `{command_string}` failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 }
