@@ -1,13 +1,13 @@
-import { Request, Response, Fields } from "wasi:http/types@0.3.0-rc-2026-01-06"
-import * as client from "wasi:http/client@0.3.0-rc-2026-01-06"
-import * as stderr from "wasi:cli/stderr@0.3.0-rc-2026-01-06"
+import { Request, Response, Fields } from "wasi:http/types@0.3.0"
+import * as client from "wasi:http/client@0.3.0"
+import * as stderr from "wasi:cli/stderr@0.3.0"
 import * as witWorld from "wit-world"
 import { IncrementalSHA256 as Sha256 } from "./sha256.js"
 
 const decoder = new TextDecoder()
 const encoder = new TextEncoder()
 
-export const wasiHttpHandler030Rc20260106 = {
+export const wasiHttpHandler030 = {
     handle: async function(request) {
         const method = request.getMethod().tag
         const path = request.getPathWithQuery()
@@ -107,11 +107,11 @@ async function log(message) {
 }
 
 function trailersFuture() {
-    return witWorld.resultOptionWasiHttpTypes030Rc20260106FieldsWasiHttpTypes030Rc20260106ErrorCodeFuture(
+    return witWorld.resultOptionWasiHttpTypes030FieldsWasiHttpTypes030ErrorCodeFuture(
         () => { tag: 'ok' }
     )[1]
 }
 
 function unitFuture() {
-    return witWorld.resultUnitWasiHttpTypes030Rc20260106ErrorCodeFuture(() => { tag: 'ok' })[1]
+    return witWorld.resultUnitWasiHttpTypes030ErrorCodeFuture(() => { tag: 'ok' })[1]
 }

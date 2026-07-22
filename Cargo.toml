@@ -7,17 +7,13 @@ edition = "2024"
 anyhow = "1.0.100"
 bytes = "1.11.1"
 tokio = { version = "1.49.0", features = ["macros", "rt", "rt-multi-thread", "fs"] }
-# TODO: switch to upstream release once
-# https://github.com/bytecodealliance/wasmtime/pull/12540 is merged and
-# released:
-wasmtime = { git = "https://github.com/dicej/wasmtime", rev = "4856b557" }
-wasmtime-wasi = { git = "https://github.com/dicej/wasmtime", rev = "4856b557" }
-wasmtime-wizer = { git = "https://github.com/dicej/wasmtime", rev = "4856b557", features = ["component-model", "wasmtime"] }
-# TODO: open a PR and switch back to upstream:
-wasm-encoder = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
-wit-component = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
-wit-dylib = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
-wit-parser = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
+wasmtime = "47.0.1"
+wasmtime-wasi = "47.0.1"
+wasmtime-wizer = { version = "47.0.1", features = ["component-model", "wasmtime"] }
+wasm-encoder = "0.254.0"
+wit-component = "0.254.0"
+wit-dylib = "0.254.0"
+wit-parser = "0.254.0"
 zstd = "0.13.3"
 heck = "0.5.0"
 clap = { version = "4.6.0", features = ["derive"] }
@@ -29,9 +25,8 @@ members = ["runtime"]
 
 [build-dependencies]
 anyhow = "1.0.100"
-# TODO: open a PR and switch back to upstream:
-wasm-encoder = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
-wasmparser = { git = "https://github.com/dicej/wasm-tools", rev = "54ef27de" }
+wasm-encoder = "0.254.0"
+wasmparser = "0.254.0"
 zstd = "0.13.3"
 
 [dev-dependencies]
@@ -41,5 +36,5 @@ http = "1.4.0"
 http-body-util = "0.1.3"
 proptest = "1.10.0"
 rand = "0.10.0"
-wasmtime-wasi = { git = "https://github.com/dicej/wasmtime", rev = "4856b557", features = ["p3"] }
-wasmtime-wasi-http = { git = "https://github.com/dicej/wasmtime", rev = "4856b557", features = ["p3"] }
+wasmtime-wasi = "47.0.1"
+wasmtime-wasi-http = "47.0.1"

@@ -1,8 +1,8 @@
 # Example: `http`
 
 This is an example of how to use [componentize-js] and [Wasmtime] to build and
-run a JS-based component targetting version `0.3.0-rc-2026-01-06` of the
-[wasi-http] `service` world.
+run a JS-based component targetting version `0.3.0` of the [wasi-http] `service`
+world.
 
 [componentize-js]: https://github.com/bytecodealliance/componentize-js
 [Wasmtime]: https://github.com/bytecodealliance/wasmtime
@@ -11,7 +11,7 @@ run a JS-based component targetting version `0.3.0-rc-2026-01-06` of the
 ## Prerequisites
 
 * [Rust](https://rustup.rs/)
-* `Wasmtime` 41.0.3
+* `Wasmtime` 47.0.0 or later
 * `componentize-js`
 * a clone of the `componentize-js` repository
 
@@ -19,7 +19,7 @@ Once you have Rust, you can install `Wasmtime` and `componentize-js` using
 `cargo install`:
 
 ```
-cargo install --version 41.0.3 wasmtime-cli
+cargo install wasmtime-cli
 cargo install --git https://github.com/dicej/componentize-js
 ```
 
@@ -28,8 +28,8 @@ cargo install --git https://github.com/dicej/componentize-js
 First, build the app and run it:
 
 ```
-componentize-js -d ../../wit -w wasi:http/service@0.3.0-rc-2026-01-06 componentize app.js -o http.wasm
-wasmtime serve -Sp3,common -Wcomponent-model-async http.wasm
+componentize-js -d ../../wit -w wasi:http/service@0.3.0 componentize app.js -o http.wasm
+wasmtime serve -Scli http.wasm
 ```
 
 Then, in another terminal, use cURL to send a request to the app:

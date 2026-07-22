@@ -1,7 +1,6 @@
 #![deny(warnings)]
 
 use {
-    anyhow::{Context as _, anyhow},
     bytes::Bytes,
     indexmap::IndexSet,
     std::{
@@ -14,6 +13,7 @@ use {
     wasmtime::{
         Config, Engine, Store,
         component::{Component, Linker, ResourceTable, ResourceType},
+        error::{Context as _, format_err},
     },
     wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe},
     wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView},
@@ -88,7 +88,11 @@ pub async fn componentize(
                 let pkg = if path.is_dir() {
                     resolve.push_dir(path)?.0
                 } else {
-                    let pkg = UnresolvedPackageGroup::parse_file(path)?;
+                    let pkg = UnresolvedPackageGroup::parse(
+                        path,
+                        &tokio::fs::read_to_string(path).await?,
+                    )
+                    .map_err(|(_, error)| error)?;
                     resolve.push_group(pkg)?
                 };
                 last_pkg = Some(pkg);
@@ -182,7 +186,6 @@ pub async fn componentize(
     let table = ResourceTable::new();
 
     let mut config = Config::new();
-    config.async_support(true);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
 
@@ -211,7 +214,7 @@ pub async fn componentize(
                 js,
             )
             .await
-            .and_then(|v| v.map_err(|e| anyhow!("{e}")))
+            .and_then(|v| v.map_err(|e| format_err!("{e}")))
             .with_context(move || {
                 format!(
                     "{}{}",
@@ -221,7 +224,7 @@ pub async fn componentize(
             })?;
     }
 
-    wizer
+    Ok(wizer
         .snapshot_component(
             cx,
             &mut WasmtimeWizerComponent {
@@ -229,7 +232,7 @@ pub async fn componentize(
                 instance,
             },
         )
-        .await
+        .await?)
 }
 
 // Stolen from https://github.com/bytecodealliance/componentize-py/blob/89af297898960efc48575d4c166d03b399568269/src/lib.rs#L761-L911
@@ -314,7 +317,7 @@ fn add_wasi_and_stubs(
                                         let interface_name = interface_name.clone();
                                         let name = name.clone();
                                         Box::pin(async move {
-                                            Err(anyhow!(
+                                            Err(format_err!(
                                                 "called trapping stub: {interface_name}#{name}"
                                             ))
                                         })
@@ -324,7 +327,7 @@ fn add_wasi_and_stubs(
                                 instance.func_new(name, {
                                     let name = name.clone();
                                     move |_, _, _, _| {
-                                        Err(anyhow!(
+                                        Err(format_err!(
                                             "called trapping stub: {interface_name}#{name}"
                                         ))
                                     }
@@ -335,7 +338,9 @@ fn add_wasi_and_stubs(
                             .resource(name, ResourceType::host::<()>(), {
                                 let name = name.clone();
                                 move |_, _| {
-                                    Err(anyhow!("called trapping stub: {interface_name}#{name}"))
+                                    Err(format_err!(
+                                        "called trapping stub: {interface_name}#{name}"
+                                    ))
                                 }
                             })
                             .map(drop),
@@ -352,22 +357,22 @@ fn add_wasi_and_stubs(
                                 let name = name.clone();
                                 move |_, _, _, _| {
                                     let name = name.clone();
-                                    Box::pin(
-                                        async move { Err(anyhow!("called trapping stub: {name}")) },
-                                    )
+                                    Box::pin(async move {
+                                        Err(format_err!("called trapping stub: {name}"))
+                                    })
                                 }
                             })
                         } else {
                             instance.func_new(name, {
                                 let name = name.clone();
-                                move |_, _, _, _| Err(anyhow!("called trapping stub: {name}"))
+                                move |_, _, _, _| Err(format_err!("called trapping stub: {name}"))
                             })
                         }
                     }
                     Stub::Resource(name) => instance
                         .resource(name, ResourceType::host::<()>(), {
                             let name = name.clone();
-                            move |_, _| Err(anyhow!("called trapping stub: {name}"))
+                            move |_, _| Err(format_err!("called trapping stub: {name}"))
                         })
                         .map(drop),
                 }?;
