@@ -10,7 +10,7 @@ use {
     rand::RngExt,
     std::{
         collections::BTreeMap,
-        env, mem,
+        env, future, mem,
         ops::DerefMut,
         pin::Pin,
         sync::{Arc, LazyLock, Mutex},
@@ -32,7 +32,7 @@ wasmtime::component::bindgen!({
     path: "src/tests.wit",
     world: "tests",
     imports: { default: async | trappable },
-    exports: { default: async | task_exit },
+    exports: { default: async },
     additional_derives: [PartialEq, Eq],
     with: {
         "componentize-js:tests/host-thing-interface.host-thing": ThingString,
@@ -43,7 +43,6 @@ pub struct ThingString(String);
 
 static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
     let mut config = Config::new();
-    config.async_support(true);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
     Engine::new(&config).unwrap()
@@ -51,13 +50,14 @@ static ENGINE: LazyLock<Engine> = LazyLock::new(|| {
 
 fn add_to_linker(linker: &mut Linker<Ctx>) -> anyhow::Result<()> {
     wasmtime_wasi::p2::add_to_linker_async(linker)?;
-    Tests::add_to_linker::<_, HasSelf<_>>(linker, |ctx| ctx)
+    Tests::add_to_linker::<_, HasSelf<_>>(linker, |ctx| ctx)?;
+    Ok(())
 }
 
 async fn pre() -> &'static TestsPre<Ctx> {
     let make = async {
         let mut linker = Linker::new(&ENGINE);
-        add_to_linker(&mut linker)?;
+        add_to_linker(&mut linker).map_err(wasmtime::Error::from_anyhow)?;
         TestsPre::new(
             linker.instantiate_pre(&Component::new(
                 &ENGINE,
@@ -70,7 +70,8 @@ async fn pre() -> &'static TestsPre<Ctx> {
                     None::<String>,
                     Some(&add_to_linker),
                 )
-                .await?,
+                .await
+                .map_err(wasmtime::Error::from_anyhow)?,
             )?)?,
         )
     };
@@ -90,8 +91,8 @@ fn store() -> Store<Ctx> {
 
 impl TestsImports for Ctx {}
 
-impl TestsImportsWithStore for HasSelf<Ctx> {
-    async fn delay<T>(_: &Accessor<T, Self>) -> anyhow::Result<()> {
+impl<T> TestsImportsWithStore<T> for HasSelf<Ctx> {
+    async fn delay(_: &Accessor<T, Self>) -> wasmtime::Result<()> {
         delay_via_yield().await;
         Ok(())
     }
@@ -125,13 +126,12 @@ async fn simple_async_export() -> anyhow::Result<()> {
                     .await
             })
             .await??
-            .0
     );
     Ok(())
 }
 
 impl componentize_js::tests::simple_import_and_export::Host for Ctx {
-    async fn foo(&mut self, v: u32) -> anyhow::Result<u32> {
+    async fn foo(&mut self, v: u32) -> wasmtime::Result<u32> {
         Ok(v + 2)
     }
 }
@@ -158,8 +158,8 @@ async fn delay_via_yield() {
 
 impl componentize_js::tests::simple_async_import_and_export::Host for Ctx {}
 
-impl componentize_js::tests::simple_async_import_and_export::HostWithStore for HasSelf<Ctx> {
-    async fn foo<T>(_: &Accessor<T, Self>, v: u32) -> anyhow::Result<u32> {
+impl<T> componentize_js::tests::simple_async_import_and_export::HostWithStore<T> for HasSelf<Ctx> {
+    async fn foo(_: &Accessor<T, Self>, v: u32) -> wasmtime::Result<u32> {
         delay_via_yield().await;
         Ok(v + 2)
     }
@@ -179,13 +179,12 @@ async fn simple_async_import_and_export() -> anyhow::Result<()> {
                     .await
             })
             .await??
-            .0
     );
     Ok(())
 }
 
 impl componentize_js::tests::types::HostResourceType for Ctx {
-    async fn drop(&mut self, v: Resource<ResourceType>) -> anyhow::Result<()> {
+    async fn drop(&mut self, v: Resource<ResourceType>) -> wasmtime::Result<()> {
         _ = v;
         Ok(())
     }
@@ -194,144 +193,144 @@ impl componentize_js::tests::types::HostResourceType for Ctx {
 impl componentize_js::tests::types::Host for Ctx {}
 
 impl componentize_js::tests::echoes::Host for Ctx {
-    async fn echo_nothing(&mut self) -> anyhow::Result<()> {
+    async fn echo_nothing(&mut self) -> wasmtime::Result<()> {
         Ok(())
     }
 
-    async fn echo_bool(&mut self, v: bool) -> anyhow::Result<bool> {
+    async fn echo_bool(&mut self, v: bool) -> wasmtime::Result<bool> {
         Ok(v)
     }
 
-    async fn echo_u8(&mut self, v: u8) -> anyhow::Result<u8> {
+    async fn echo_u8(&mut self, v: u8) -> wasmtime::Result<u8> {
         Ok(v)
     }
 
-    async fn echo_s8(&mut self, v: i8) -> anyhow::Result<i8> {
+    async fn echo_s8(&mut self, v: i8) -> wasmtime::Result<i8> {
         Ok(v)
     }
 
-    async fn echo_u16(&mut self, v: u16) -> anyhow::Result<u16> {
+    async fn echo_u16(&mut self, v: u16) -> wasmtime::Result<u16> {
         Ok(v)
     }
 
-    async fn echo_s16(&mut self, v: i16) -> anyhow::Result<i16> {
+    async fn echo_s16(&mut self, v: i16) -> wasmtime::Result<i16> {
         Ok(v)
     }
 
-    async fn echo_u32(&mut self, v: u32) -> anyhow::Result<u32> {
+    async fn echo_u32(&mut self, v: u32) -> wasmtime::Result<u32> {
         Ok(v)
     }
 
-    async fn echo_s32(&mut self, v: i32) -> anyhow::Result<i32> {
+    async fn echo_s32(&mut self, v: i32) -> wasmtime::Result<i32> {
         Ok(v)
     }
 
-    async fn echo_char(&mut self, v: char) -> anyhow::Result<char> {
+    async fn echo_char(&mut self, v: char) -> wasmtime::Result<char> {
         Ok(v)
     }
 
-    async fn echo_u64(&mut self, v: u64) -> anyhow::Result<u64> {
+    async fn echo_u64(&mut self, v: u64) -> wasmtime::Result<u64> {
         Ok(v)
     }
 
-    async fn echo_s64(&mut self, v: i64) -> anyhow::Result<i64> {
+    async fn echo_s64(&mut self, v: i64) -> wasmtime::Result<i64> {
         Ok(v)
     }
 
-    async fn echo_f32(&mut self, v: f32) -> anyhow::Result<f32> {
+    async fn echo_f32(&mut self, v: f32) -> wasmtime::Result<f32> {
         Ok(v)
     }
 
-    async fn echo_f64(&mut self, v: f64) -> anyhow::Result<f64> {
+    async fn echo_f64(&mut self, v: f64) -> wasmtime::Result<f64> {
         Ok(v)
     }
 
-    async fn echo_string(&mut self, v: String) -> anyhow::Result<String> {
+    async fn echo_string(&mut self, v: String) -> wasmtime::Result<String> {
         Ok(v)
     }
 
-    async fn echo_list_bool(&mut self, v: Vec<bool>) -> anyhow::Result<Vec<bool>> {
+    async fn echo_list_bool(&mut self, v: Vec<bool>) -> wasmtime::Result<Vec<bool>> {
         Ok(v)
     }
 
-    async fn echo_list_u8(&mut self, v: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+    async fn echo_list_u8(&mut self, v: Vec<u8>) -> wasmtime::Result<Vec<u8>> {
         Ok(v)
     }
 
-    async fn echo_list_s8(&mut self, v: Vec<i8>) -> anyhow::Result<Vec<i8>> {
+    async fn echo_list_s8(&mut self, v: Vec<i8>) -> wasmtime::Result<Vec<i8>> {
         Ok(v)
     }
 
-    async fn echo_list_u16(&mut self, v: Vec<u16>) -> anyhow::Result<Vec<u16>> {
+    async fn echo_list_u16(&mut self, v: Vec<u16>) -> wasmtime::Result<Vec<u16>> {
         Ok(v)
     }
 
-    async fn echo_list_s16(&mut self, v: Vec<i16>) -> anyhow::Result<Vec<i16>> {
+    async fn echo_list_s16(&mut self, v: Vec<i16>) -> wasmtime::Result<Vec<i16>> {
         Ok(v)
     }
 
-    async fn echo_list_u32(&mut self, v: Vec<u32>) -> anyhow::Result<Vec<u32>> {
+    async fn echo_list_u32(&mut self, v: Vec<u32>) -> wasmtime::Result<Vec<u32>> {
         Ok(v)
     }
 
-    async fn echo_list_s32(&mut self, v: Vec<i32>) -> anyhow::Result<Vec<i32>> {
+    async fn echo_list_s32(&mut self, v: Vec<i32>) -> wasmtime::Result<Vec<i32>> {
         Ok(v)
     }
 
-    async fn echo_list_char(&mut self, v: Vec<char>) -> anyhow::Result<Vec<char>> {
+    async fn echo_list_char(&mut self, v: Vec<char>) -> wasmtime::Result<Vec<char>> {
         Ok(v)
     }
 
-    async fn echo_list_u64(&mut self, v: Vec<u64>) -> anyhow::Result<Vec<u64>> {
+    async fn echo_list_u64(&mut self, v: Vec<u64>) -> wasmtime::Result<Vec<u64>> {
         Ok(v)
     }
 
-    async fn echo_list_s64(&mut self, v: Vec<i64>) -> anyhow::Result<Vec<i64>> {
+    async fn echo_list_s64(&mut self, v: Vec<i64>) -> wasmtime::Result<Vec<i64>> {
         Ok(v)
     }
 
-    async fn echo_list_f32(&mut self, v: Vec<f32>) -> anyhow::Result<Vec<f32>> {
+    async fn echo_list_f32(&mut self, v: Vec<f32>) -> wasmtime::Result<Vec<f32>> {
         Ok(v)
     }
 
-    async fn echo_list_f64(&mut self, v: Vec<f64>) -> anyhow::Result<Vec<f64>> {
+    async fn echo_list_f64(&mut self, v: Vec<f64>) -> wasmtime::Result<Vec<f64>> {
         Ok(v)
     }
 
-    async fn echo_list_string(&mut self, v: Vec<String>) -> anyhow::Result<Vec<String>> {
+    async fn echo_list_string(&mut self, v: Vec<String>) -> wasmtime::Result<Vec<String>> {
         Ok(v)
     }
 
-    async fn echo_list_list_u8(&mut self, v: Vec<Vec<u8>>) -> anyhow::Result<Vec<Vec<u8>>> {
+    async fn echo_list_list_u8(&mut self, v: Vec<Vec<u8>>) -> wasmtime::Result<Vec<Vec<u8>>> {
         Ok(v)
     }
 
     async fn echo_list_list_list_u8(
         &mut self,
         v: Vec<Vec<Vec<u8>>>,
-    ) -> anyhow::Result<Vec<Vec<Vec<u8>>>> {
+    ) -> wasmtime::Result<Vec<Vec<Vec<u8>>>> {
         Ok(v)
     }
 
-    async fn echo_option_u8(&mut self, v: Option<u8>) -> anyhow::Result<Option<u8>> {
+    async fn echo_option_u8(&mut self, v: Option<u8>) -> wasmtime::Result<Option<u8>> {
         Ok(v)
     }
 
     async fn echo_option_option_u8(
         &mut self,
         v: Option<Option<u8>>,
-    ) -> anyhow::Result<Option<Option<u8>>> {
+    ) -> wasmtime::Result<Option<Option<u8>>> {
         Ok(v)
     }
 
-    async fn echo_result_u8_u8(&mut self, v: Result<u8, u8>) -> anyhow::Result<Result<u8, u8>> {
+    async fn echo_result_u8_u8(&mut self, v: Result<u8, u8>) -> wasmtime::Result<Result<u8, u8>> {
         Ok(v)
     }
 
     async fn echo_result_result_u8_u8_u8(
         &mut self,
         v: Result<Result<u8, u8>, u8>,
-    ) -> anyhow::Result<Result<Result<u8, u8>, u8>> {
+    ) -> wasmtime::Result<Result<Result<u8, u8>, u8>> {
         Ok(v)
     }
 
@@ -353,7 +352,7 @@ impl componentize_js::tests::echoes::Host for Ctx {
         v14: Vec<bool>,
         v15: Vec<u8>,
         v16: Vec<u16>,
-    ) -> anyhow::Result<(
+    ) -> wasmtime::Result<(
         bool,
         u8,
         u16,
@@ -379,36 +378,36 @@ impl componentize_js::tests::echoes::Host for Ctx {
     async fn echo_resource(
         &mut self,
         v: Resource<ResourceType>,
-    ) -> anyhow::Result<Resource<ResourceType>> {
+    ) -> wasmtime::Result<Resource<ResourceType>> {
         Ok(v)
     }
 
-    async fn accept_borrow(&mut self, v: Resource<ResourceType>) -> anyhow::Result<()> {
+    async fn accept_borrow(&mut self, v: Resource<ResourceType>) -> wasmtime::Result<()> {
         _ = v;
         Ok(())
     }
 
-    async fn echo_record(&mut self, v: RecordType) -> anyhow::Result<RecordType> {
+    async fn echo_record(&mut self, v: RecordType) -> wasmtime::Result<RecordType> {
         Ok(v)
     }
 
-    async fn echo_enum(&mut self, v: EnumType) -> anyhow::Result<EnumType> {
+    async fn echo_enum(&mut self, v: EnumType) -> wasmtime::Result<EnumType> {
         Ok(v)
     }
 
-    async fn echo_flags(&mut self, v: FlagsType) -> anyhow::Result<FlagsType> {
+    async fn echo_flags(&mut self, v: FlagsType) -> wasmtime::Result<FlagsType> {
         Ok(v)
     }
 
-    async fn echo_variant(&mut self, v: VariantType) -> anyhow::Result<VariantType> {
+    async fn echo_variant(&mut self, v: VariantType) -> wasmtime::Result<VariantType> {
         Ok(v)
     }
 
-    async fn echo_stream(&mut self, v: StreamReader<u8>) -> anyhow::Result<StreamReader<u8>> {
+    async fn echo_stream(&mut self, v: StreamReader<u8>) -> wasmtime::Result<StreamReader<u8>> {
         Ok(v)
     }
 
-    async fn echo_future(&mut self, v: FutureReader<u8>) -> anyhow::Result<FutureReader<u8>> {
+    async fn echo_future(&mut self, v: FutureReader<u8>) -> wasmtime::Result<FutureReader<u8>> {
         Ok(v)
     }
 }
@@ -455,7 +454,8 @@ async fn echo_nothing() -> anyhow::Result<()> {
     instance
         .componentize_js_tests_echoes()
         .call_echo_nothing(&mut store)
-        .await
+        .await?;
+    Ok(())
 }
 
 #[test]
@@ -1253,7 +1253,7 @@ fn echo_variants() -> anyhow::Result<()> {
 async fn echo_stream() -> anyhow::Result<()> {
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
-    let stream = StreamReader::new(&mut store, vec![42]);
+    let stream = StreamReader::new(&mut store, vec![42])?;
     // TODO: read from returned stream and assert content matches what was
     // produced.
     instance
@@ -1267,7 +1267,7 @@ async fn echo_stream() -> anyhow::Result<()> {
 async fn echo_future() -> anyhow::Result<()> {
     let mut store = store();
     let instance = pre().await.instantiate_async(&mut store).await?;
-    let future = FutureReader::new(&mut store, async { anyhow::Ok(42) });
+    let future = FutureReader::new(&mut store, async { Ok::<_, wasmtime::Error>(42) })?;
     // TODO: read from returned future and assert content matches what was
     // produced.
     instance
@@ -1305,7 +1305,7 @@ impl<D, T: Lift + Unpin + 'static> StreamProducer<D> for VecProducer<T> {
         _: StoreContextMut<D>,
         mut destination: Destination<Self::Item, Self::Buffer>,
         _: bool,
-    ) -> Poll<anyhow::Result<StreamResult>> {
+    ) -> Poll<wasmtime::Result<StreamResult>> {
         let sleep = &mut self.as_mut().get_mut().sleep;
         task::ready!(sleep.as_mut().poll(cx));
         *sleep = async {}.boxed();
@@ -1342,7 +1342,7 @@ impl<D, T: Lift + 'static> StreamConsumer<D> for VecConsumer<T> {
         store: StoreContextMut<D>,
         mut source: Source<Self::Item>,
         _: bool,
-    ) -> Poll<anyhow::Result<StreamResult>> {
+    ) -> Poll<wasmtime::Result<StreamResult>> {
         let sleep = &mut self.as_mut().get_mut().sleep;
         task::ready!(sleep.as_mut().poll(cx));
         *sleep = async {}.boxed();
@@ -1368,18 +1368,19 @@ async fn test_echo_stream_u8(delay: bool) -> anyhow::Result<()> {
     store
         .run_concurrent(async |store| {
             let expected = b"Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
-            let stream = store
-                .with(|store| StreamReader::new(store, VecProducer::new(expected.to_vec(), delay)));
+            let stream = store.with(|store| {
+                StreamReader::new(store, VecProducer::new(expected.to_vec(), delay))
+            })?;
 
-            let (stream, task) = instance
+            let stream = instance
                 .componentize_js_tests_streams_and_futures()
                 .call_echo_stream_u8(store, stream)
                 .await?;
 
             let received = Arc::new(Mutex::new(Vec::with_capacity(expected.len())));
-            store.with(|store| stream.pipe(store, VecConsumer::new(received.clone(), delay)));
+            store.with(|store| stream.pipe(store, VecConsumer::new(received.clone(), delay)))?;
 
-            task.block(store).await;
+            future::poll_fn(|cx| store.poll_no_interesting_tasks(cx)).await;
 
             assert_eq!(expected, &received.lock().unwrap()[..]);
 
@@ -1416,7 +1417,7 @@ impl<D, T: Unpin + Send + 'static> FutureProducer<D> for OptionProducer<T> {
         cx: &mut Context<'_>,
         _: StoreContextMut<D>,
         _: bool,
-    ) -> Poll<anyhow::Result<Option<T>>> {
+    ) -> Poll<wasmtime::Result<Option<T>>> {
         let sleep = &mut self.as_mut().get_mut().sleep;
         task::ready!(sleep.as_mut().poll(cx));
         *sleep = async {}.boxed();
@@ -1452,7 +1453,7 @@ impl<D, T: Lift + 'static> FutureConsumer<D> for OptionConsumer<T> {
         store: StoreContextMut<D>,
         mut source: Source<Self::Item>,
         _: bool,
-    ) -> Poll<anyhow::Result<()>> {
+    ) -> Poll<wasmtime::Result<()>> {
         let sleep = &mut self.as_mut().get_mut().sleep;
         task::ready!(sleep.as_mut().poll(cx));
         *sleep = async {}.boxed();
@@ -1483,17 +1484,17 @@ async fn test_echo_future_string(delay: bool) -> anyhow::Result<()> {
                     store,
                     OptionProducer::new(Some(expected.to_string()), delay),
                 )
-            });
+            })?;
 
-            let (future, task) = instance
+            let future = instance
                 .componentize_js_tests_streams_and_futures()
                 .call_echo_future_string(store, future)
                 .await?;
 
             let received = Arc::new(Mutex::new(None::<String>));
-            store.with(|store| future.pipe(store, OptionConsumer::new(received.clone(), delay)));
+            store.with(|store| future.pipe(store, OptionConsumer::new(received.clone(), delay)))?;
 
-            task.block(store).await;
+            future::poll_fn(|cx| store.poll_no_interesting_tasks(cx)).await;
 
             assert_eq!(
                 expected,
@@ -1536,7 +1537,7 @@ impl<D, T: Lift + 'static> StreamConsumer<D> for OneAtATime<T> {
         store: StoreContextMut<D>,
         mut source: Source<Self::Item>,
         _: bool,
-    ) -> Poll<anyhow::Result<StreamResult>> {
+    ) -> Poll<wasmtime::Result<StreamResult>> {
         let delay = self.delay;
         let sleep = &mut self.as_mut().get_mut().sleep;
         task::ready!(sleep.as_mut().poll(cx));
@@ -1582,18 +1583,20 @@ async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
             // one at a time, forcing us to retake ownership of the unwritten
             // items between writes.
             let stream =
-                store.with(|store| StreamReader::new(store, VecProducer::new(things, delay)));
+                store.with(|store| StreamReader::new(store, VecProducer::new(things, delay)))?;
 
-            let (stream, task) = instance.call_short_reads(store, stream).await?;
+            let stream = instance.call_short_reads(store, stream).await?;
 
             let received_things = Arc::new(Mutex::new(
                 Vec::<streams_and_futures::Thing>::with_capacity(count),
             ));
             // Read only one item at a time, forcing the sender to retake
             // ownership of any unwritten items.
-            store.with(|store| stream.pipe(store, OneAtATime::new(received_things.clone(), delay)));
+            store.with(|store| {
+                stream.pipe(store, OneAtATime::new(received_things.clone(), delay))
+            })?;
 
-            task.block(store).await;
+            future::poll_fn(|cx| store.poll_no_interesting_tasks(cx)).await;
 
             assert_eq!(count, received_things.lock().unwrap().len());
 
@@ -1612,7 +1615,7 @@ async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
             }
 
             let mut received_strings = BTreeMap::new();
-            while let Some((index, (string, _))) = futures.try_next().await? {
+            while let Some((index, string)) = futures.try_next().await? {
                 received_strings.insert(index, string);
             }
 
@@ -1635,7 +1638,7 @@ async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
             }
 
             let mut received_strings = BTreeMap::new();
-            while let Some((index, (string, _))) = futures.try_next().await? {
+            while let Some((index, string)) = futures.try_next().await? {
                 received_strings.insert(index, string);
             }
 
@@ -1658,28 +1661,28 @@ async fn test_short_reads(delay: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl componentize_js::tests::host_thing_interface::HostHostThingWithStore for HasSelf<Ctx> {
-    async fn get<T>(
+impl<T> componentize_js::tests::host_thing_interface::HostHostThingWithStore<T> for HasSelf<Ctx> {
+    async fn get(
         accessor: &Accessor<T, Self>,
         this: Resource<ThingString>,
-    ) -> anyhow::Result<String> {
+    ) -> wasmtime::Result<String> {
         accessor.with(|mut store| Ok(store.get().table.get(&this)?.0.clone()))
     }
 
-    async fn get_static<T>(
+    async fn get_static(
         accessor: &Accessor<T, Self>,
         this: Resource<ThingString>,
-    ) -> anyhow::Result<String> {
+    ) -> wasmtime::Result<String> {
         accessor.with(|mut store| Ok(store.get().table.get(&this)?.0.clone()))
     }
 }
 
 impl componentize_js::tests::host_thing_interface::HostHostThing for Ctx {
-    async fn new(&mut self, v: String) -> anyhow::Result<Resource<ThingString>> {
+    async fn new(&mut self, v: String) -> wasmtime::Result<Resource<ThingString>> {
         Ok(self.ctx().table.push(ThingString(v))?)
     }
 
-    async fn drop(&mut self, this: Resource<ThingString>) -> anyhow::Result<()> {
+    async fn drop(&mut self, this: Resource<ThingString>) -> wasmtime::Result<()> {
         Ok(self.ctx().table.delete(this).map(|_| ())?)
     }
 }
@@ -1714,18 +1717,20 @@ async fn test_short_reads_host(delay: bool) -> anyhow::Result<()> {
             // one at a time, forcing us to retake ownership of the unwritten
             // items between writes.
             let stream =
-                store.with(|store| StreamReader::new(store, VecProducer::new(things, delay)));
+                store.with(|store| StreamReader::new(store, VecProducer::new(things, delay)))?;
 
-            let (stream, task) = instance.call_short_reads_host(store, stream).await?;
+            let stream = instance.call_short_reads_host(store, stream).await?;
 
             let received_things = Arc::new(Mutex::new(
                 Vec::<Resource<ThingString>>::with_capacity(count),
             ));
             // Read only one item at a time, forcing the sender to retake
             // ownership of any unwritten items.
-            store.with(|store| stream.pipe(store, OneAtATime::new(received_things.clone(), delay)));
+            store.with(|store| {
+                stream.pipe(store, OneAtATime::new(received_things.clone(), delay))
+            })?;
 
-            task.block(store).await;
+            future::poll_fn(|cx| store.poll_no_interesting_tasks(cx)).await;
 
             assert_eq!(count, received_things.lock().unwrap().len());
 
@@ -1770,22 +1775,22 @@ async fn test_dropped_future_reader(delay: bool) -> anyhow::Result<()> {
     let it = store
         .run_concurrent(async |store| {
             let expected = "Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
-            let ((mut rx1, rx2), task) = instance
+            let (mut rx1, rx2) = instance
                 .call_dropped_future_reader(store, expected.into())
                 .await?;
             // Close the future without reading the value.  This will
             // force the sender to retake ownership of the value it
             // tried to write.
-            rx1.close_with(store);
+            rx1.close_with(store)?;
 
             let received = Arc::new(Mutex::new(None::<streams_and_futures::Thing>));
-            store.with(|store| rx2.pipe(store, OptionConsumer::new(received.clone(), delay)));
+            store.with(|store| rx2.pipe(store, OptionConsumer::new(received.clone(), delay)))?;
 
-            task.block(store).await;
+            future::poll_fn(|cx| store.poll_no_interesting_tasks(cx)).await;
 
             let it = received.lock().unwrap().take().unwrap();
 
-            assert_eq!(expected, &thing.call_get(store, it, false).await?.0);
+            assert_eq!(expected, &thing.call_get(store, it, false).await?);
 
             anyhow::Ok(it)
         })
@@ -1814,18 +1819,18 @@ async fn test_dropped_future_reader_host(delay: bool) -> anyhow::Result<()> {
     store
         .run_concurrent(async |store| {
             let expected = "Beware the Jubjub bird, and shun\n\tThe frumious Bandersnatch!";
-            let ((mut rx1, rx2), task) = instance
+            let (mut rx1, rx2) = instance
                 .call_dropped_future_reader_host(store, expected.into())
                 .await?;
             // Close the future without reading the value.  This will
             // force the sender to retake ownership of the value it
             // tried to write.
-            rx1.close_with(store);
+            rx1.close_with(store)?;
 
             let received = Arc::new(Mutex::new(None::<Resource<ThingString>>));
-            store.with(|store| rx2.pipe(store, OptionConsumer::new(received.clone(), delay)));
+            store.with(|store| rx2.pipe(store, OptionConsumer::new(received.clone(), delay)))?;
 
-            task.block(store).await;
+            future::poll_fn(|cx| store.poll_no_interesting_tasks(cx)).await;
 
             let it = store.with(|mut store| {
                 anyhow::Ok(

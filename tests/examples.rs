@@ -10,18 +10,15 @@ use {
         component::{Component, Instance, Linker, ResourceTable},
     },
     wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::pipe::MemoryOutputPipe},
-    wasmtime_wasi_http::p3::{
-        Request, WasiHttpCtx, WasiHttpCtxView, WasiHttpView, bindings::Service,
+    wasmtime_wasi_http::{
+        WasiHttpCtx,
+        p3::{Request, WasiHttpCtxView, WasiHttpView, bindings::Service},
     },
 };
 
-struct MyWasiHttpCtx;
-
-impl WasiHttpCtx for MyWasiHttpCtx {}
-
 struct Ctx {
     wasi: WasiCtx,
-    http: MyWasiHttpCtx,
+    http: WasiHttpCtx,
     table: ResourceTable,
 }
 
@@ -37,6 +34,7 @@ impl WasiView for Ctx {
 impl WasiHttpView for Ctx {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
+            hooks: Default::default(),
             table: &mut self.table,
             ctx: &mut self.http,
         }
@@ -48,7 +46,6 @@ async fn test(
     fun: impl AsyncFnOnce(&mut Store<Ctx>, &Instance, MemoryOutputPipe) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let mut config = Config::new();
-    config.async_support(true);
     config.wasm_component_model(true);
     config.wasm_component_model_async(true);
 
@@ -67,7 +64,7 @@ async fn test(
         Ctx {
             wasi,
             table,
-            http: MyWasiHttpCtx,
+            http: WasiHttpCtx::new(),
         },
     );
 
@@ -98,7 +95,7 @@ async fn cli() -> anyhow::Result<()> {
     test(
         &componentize_js::componentize(
             Wit::Paths(&["wit"]),
-            Some("wasi:cli/command@0.3.0-rc-2026-01-06"),
+            Some("wasi:cli/command@0.3.0"),
             &[],
             false,
             &fs::read_to_string("examples/cli/app.js").await?,
@@ -111,10 +108,12 @@ async fn cli() -> anyhow::Result<()> {
             store
                 .run_concurrent(async |store| command.wasi_cli_run().call_run(store).await)
                 .await??
-                .0
                 .map_err(|()| anyhow!("command failed"))?;
 
-            assert_eq!("Hello, world!", String::from_utf8_lossy(&stdout.contents()));
+            assert_eq!(
+                "Hello, world!\n",
+                String::from_utf8_lossy(&stdout.contents())
+            );
 
             Ok(())
         },
@@ -127,7 +126,7 @@ async fn http() -> anyhow::Result<()> {
     test(
         &componentize_js::componentize(
             Wit::Paths(&["wit"]),
-            Some("wasi:http/service@0.3.0-rc-2026-01-06"),
+            Some("wasi:http/service@0.3.0"),
             &[],
             false,
             &fs::read_to_string("examples/http/app.js").await?,
@@ -159,8 +158,7 @@ All mimsy were the borogoves,
                     let response = service
                         .wasi_http_handler()
                         .call_handle(store, request)
-                        .await?
-                        .0?;
+                        .await??;
 
                     let response = store.with(|mut store| {
                         store
