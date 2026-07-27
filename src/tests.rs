@@ -183,6 +183,44 @@ async fn simple_async_import_and_export() -> anyhow::Result<()> {
     Ok(())
 }
 
+impl componentize_js::tests::async_import_and_export_result::Host for Ctx {}
+
+impl<T> componentize_js::tests::async_import_and_export_result::HostWithStore<T> for HasSelf<Ctx> {
+    async fn foo(_: &Accessor<T, Self>, v: Result<u32, u32>) -> wasmtime::Result<Result<u32, u32>> {
+        delay_via_yield().await;
+        Ok(v.map(|v| v + 2).map_err(|v| v + 3))
+    }
+}
+
+#[tokio::test]
+async fn async_import_and_export_result() -> anyhow::Result<()> {
+    let mut store = store();
+    let instance = pre().await.instantiate_async(&mut store).await?;
+    assert_eq!(
+        Ok(42 + 3 + 2),
+        store
+            .run_concurrent(async |accessor| {
+                instance
+                    .componentize_js_tests_async_import_and_export_result()
+                    .call_foo(accessor, Ok(42))
+                    .await
+            })
+            .await??
+    );
+    assert_eq!(
+        Err(42 + 3 + 3),
+        store
+            .run_concurrent(async |accessor| {
+                instance
+                    .componentize_js_tests_async_import_and_export_result()
+                    .call_foo(accessor, Err(42))
+                    .await
+            })
+            .await??
+    );
+    Ok(())
+}
+
 impl componentize_js::tests::types::HostResourceType for Ctx {
     async fn drop(&mut self, v: Resource<ResourceType>) -> wasmtime::Result<()> {
         _ = v;

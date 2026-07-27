@@ -1,6 +1,7 @@
 import * as echoes from "componentize-js:tests/echoes"
 import * as simpleImportAndExport from "componentize-js:tests/simple-import-and-export"
 import * as simpleAsyncImportAndExport from "componentize-js:tests/simple-async-import-and-export"
+import * as asyncImportAndExportResult from "componentize-js:tests/async-import-and-export-result"
 import * as hostThingInterface from "componentize-js:tests/host-thing-interface"
 import * as witWorld from "wit-world"
 
@@ -89,6 +90,12 @@ export const componentizeJsTestsSimpleImportAndExport = {
 export const componentizeJsTestsSimpleAsyncImportAndExport = {
     foo: function(v) {
         return simpleAsyncImportAndExport.foo(v + 3)
+    }
+}
+
+export const componentizeJsTestsAsyncImportAndExportResult = {
+    foo: function(v) {
+        return asyncImportAndExportResult.foo({ val: v.val + 3, tag: v.tag })
     }
 }
 

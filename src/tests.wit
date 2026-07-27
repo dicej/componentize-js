@@ -16,6 +16,10 @@ interface simple-async-import-and-export {
   foo: async func(v: u32) -> u32;
 }
 
+interface async-import-and-export-result {
+  foo: async func(v: result<u32, u32>) -> result<u32, u32>;
+}
+
 interface types {
   resource resource-type { }
 
@@ -124,6 +128,8 @@ world tests {
   import simple-import-and-export;
   export simple-async-import-and-export;
   import simple-async-import-and-export;
+  export async-import-and-export-result;
+  import async-import-and-export-result;
   import echoes;
   export echoes;
   export streams-and-futures;
