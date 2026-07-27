@@ -2086,8 +2086,8 @@ impl Interpreter for MyInterpreter {
                     rooted!(&in(cx) let resolve = call.pop());
 
                     let (result, resolve_or_reject) = match result {
-                        Ok(value) => (value.unwrap_or_else(UndefinedValue), resolve),
-                        Err(value) => (value, reject),
+                        Ok(value) => (value.unwrap_or_else(UndefinedValue), &resolve),
+                        Err(value) => (value, &reject),
                     };
                     rooted!(&in(cx) let params = vec![result]);
 
