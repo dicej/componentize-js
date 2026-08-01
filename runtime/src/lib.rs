@@ -995,7 +995,16 @@ fn handle_export_result(
         }
         Some(_) => {
             if !fulfilled {
-                panic!("caught unexpected exception for infallible exported function type");
+                rooted!(&in(cx) let mut value = value.get());
+                let string = unsafe {
+                    jsstr_to_string(
+                        cx.raw_cx(),
+                        NonNull::new(ToString(cx.raw_cx(), value.handle())).unwrap(),
+                    )
+                };
+                panic!(
+                    "caught unexpected exception for infallible exported function type: `{string}`"
+                );
             }
             call.push(value.get());
         }
@@ -2544,6 +2553,7 @@ impl Call for MyCall<'_> {
     fn pop_result(&mut self, ty: WitResult) -> u32 {
         let cx = &mut context();
         rooted!(&in(cx) let wrapper = self.pop().to_object());
+
         let tag = unsafe {
             jsstr_to_string(
                 cx.raw_cx(),
@@ -2591,7 +2601,7 @@ impl Call for MyCall<'_> {
     fn pop_record(&mut self, ty: wit::Record) {
         let cx = &mut context();
         rooted!(&in(cx) let record = self.pop().to_object());
-        for (name, _) in ty.fields() {
+        for (name, _) in ty.fields().rev() {
             self.push(get(
                 cx,
                 record.handle(),
@@ -2727,7 +2737,7 @@ impl Call for MyCall<'_> {
     fn push_record(&mut self, ty: wit::Record) {
         let cx = &mut context();
         rooted!(&in(cx) let value = unsafe { JS_NewObject(cx, ptr::null_mut()) });
-        for (name, _) in ty.fields() {
+        for (name, _) in ty.fields().rev() {
             rooted!(&in(cx) let field = self.pop());
             set(
                 cx,
